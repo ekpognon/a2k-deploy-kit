@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# lint.yml — CI lint du kit a2k-deploy-kit (WFPUB 2026-08-19)
+#
+# actionlint (workflows + composite actions) + shellcheck (scripts du kit).
+# Scope shellcheck ALIGNÉ sur la couverture héritée de a2k-shared-infra
+# lint-shared-scripts.yml (app-backup.sh + backup-lib.sh + freshness-oracle.sh) —
+# les autres scripts portent des findings PRÉ-EXISTANTS warning/info (SC2155/SC2034/
+# SC1091/SC2029, 0 error) hérités : élargissement à `scripts/*.sh scripts/lib/*.sh`
+# = session dédiée (dette héritée, cf. TODO historique shared-infra).
+# A15 : actions SHA-pinnées + permissions: {} top-level, contents: read job only.
+# ─────────────────────────────────────────────────────────────────────────────
+name: Lint kit (actionlint + shellcheck)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/**'
+      - 'scripts/**'
+  pull_request:
+    paths:
+      - '.github/**'
+      - 'scripts/**'
+
+permissions: {}
+
+jobs:
+  actionlint:
+    name: actionlint workflows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - name: Run actionlint (official docker image pinned)
+        uses: docker://rhysd/actionlint:1.7.7
+        with:
+          args: -color
+
+  shellcheck:
+    name: shellcheck scripts kit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Lint scripts backup + freshness (scope hérité — cf. header dette)
+        run: |
+          shellcheck scripts/app-backup.sh scripts/lib/backup-lib.sh scripts/lib/freshness-oracle.sh
+          echo "✓ shellcheck backup + freshness scripts OK"

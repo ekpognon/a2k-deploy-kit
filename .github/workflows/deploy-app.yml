@@ -6,7 +6,8 @@ name: Deploy App (reusable workflow_call)
 # Apps consommatrices N'ONT PLUS BESOIN de deploy.sh (legacy deploy.sh.template SUPPRIMÉ cycle 29).
 #
 # Reusable workflow GHA invoque depuis app repos (TopXpress + Soiroke + futures briques SI A2K) via
-# `uses: ekpognon/a2k-shared-infra/.github/workflows/deploy-app.yml@<sha>` + `secrets: inherit`.
+# `uses: ekpognon/a2k-deploy-kit/.github/workflows/deploy-app.yml@develop` + `secrets: inherit`
+# (WFPUB 2026-08-19 : extrait de a2k-shared-infra — @develop = mode itération ; pin SHA = reco prd A15).
 #
 # Architecture push-and-forget VPS-orchestrator strict (ADR-004 cycle 12 — cohérent
 # .github/workflows/deploy.yml shared Traefik référence) :
