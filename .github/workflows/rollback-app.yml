@@ -48,8 +48,9 @@ on:
     secrets:
       DEPLOY_SSH_KEY:
         required: true
-      A2K_SHARED_INFRA_TOKEN:
-        required: false
+      # WFPUB 2026-08-19 : secret A2K_SHARED_INFRA_TOKEN SUPPRIMÉ — le kit a2k-deploy-kit est
+      # un repo PUBLIC : le self-checkout workflow_repository@workflow_sha n'exige plus de PAT
+      # (token par défaut actions/checkout suffit). Plus AUCUN checkout privé dans la chaîne.
 
 concurrency:
   group: app-write-${{ inputs.env }}-${{ inputs.app_name }}
@@ -78,8 +79,6 @@ jobs:
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
-          token: ${{ secrets.A2K_SHARED_INFRA_TOKEN }}
-
       # Cycle 29 Wave 1 cont sub-action 6 : refactor adoption composite actions.
       # SSH setup inline DÉLÉGUÉ aux composite actions (ssh-execute + scp-vps internal).
       - name: Resolve VPS target params (env-specific host + fingerprint selection)
@@ -176,9 +175,9 @@ jobs:
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
+          # WFPUB : `shared-infra` = nom HISTORIQUE du path runner (héritage a2k-shared-infra,
+          # origine du kit). NON renommé volontairement (minimal diff extraction).
           path: shared-infra
-          token: ${{ secrets.A2K_SHARED_INFRA_TOKEN }}
-
       # E2E2 ADR-018 (DA2) — Oracle O1 SEUL sur rollback (même piège checkout que deploy).
       # O3/O4 N/A : rollback-app.yml ne transporte NI .env.config NI compose (seulement scripts
       # shared + hooks/). Pas de job alerting : opération manuelle supervisée (run regardé par
@@ -405,8 +404,6 @@ jobs:
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
-          token: ${{ secrets.A2K_SHARED_INFRA_TOKEN }}
-
       - name: Poll healthcheck endpoint (composite healthcheck-wait)
         uses: ./.github/actions/healthcheck-wait
         with:

@@ -75,8 +75,9 @@ on:
     secrets:
       DEPLOY_SSH_KEY:
         required: true
-      A2K_SHARED_INFRA_TOKEN:
-        required: false
+      # WFPUB 2026-08-19 : secret A2K_SHARED_INFRA_TOKEN SUPPRIMÉ — le kit a2k-deploy-kit est
+      # un repo PUBLIC : le self-checkout workflow_repository@workflow_sha n'exige plus de PAT
+      # (token par défaut actions/checkout suffit). Plus AUCUN checkout privé dans la chaîne.
       # E2E2 ADR-018 (DA3) — alerting freshness canal mail Brevo SMTP (best-effort).
       # Optionnels : non câblés → step mail skip graceful (::notice::). Recommandé org-level
       # (couvre TopXpress + Soiroke en 1 setup) — câblage valeurs user-driven, jamais dans le repo.
@@ -119,8 +120,6 @@ jobs:
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
-          token: ${{ secrets.A2K_SHARED_INFRA_TOKEN }}
-
       # Cycle 29 Wave 1 cont sub-action 6 (Mode A user 2026-06-22) :
       # Refactor adoption composite actions — SSH setup inline ~50L remplacé par composite
       # action invocations (scp-vps + ssh-execute) qui gèrent SSH key + known_hosts INTERNAL.
@@ -248,9 +247,9 @@ jobs:
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
+          # WFPUB : `shared-infra` = nom HISTORIQUE du path runner (héritage a2k-shared-infra,
+          # origine du kit). NON renommé volontairement (minimal diff extraction).
           path: shared-infra
-          token: ${{ secrets.A2K_SHARED_INFRA_TOKEN }}
-
       # E2E2 ADR-018 — Oracle O1 fraîcheur checkout caller : HEAD app-repo/ == app_ref demandé.
       # rc 0 PASS / rc 1 FAIL (checkout stale/divergent — abort AVANT tout transport) /
       # rc 2 WARN (app_ref vide '' S5 — invoker non conforme au contrat, fallback github.sha).
@@ -789,8 +788,6 @@ jobs:
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
-          token: ${{ secrets.A2K_SHARED_INFRA_TOKEN }}
-
       - name: Poll healthcheck endpoint (composite healthcheck-wait)
         uses: ./.github/actions/healthcheck-wait
         with:
@@ -831,8 +828,6 @@ jobs:
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
-          token: ${{ secrets.A2K_SHARED_INFRA_TOKEN }}
-
       # Cycle 29 Wave 1 cont sub-action 6 : refactor adoption composite actions.
       - name: Resolve VPS target params (env-specific host + fingerprint selection)
         env:
