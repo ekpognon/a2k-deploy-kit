@@ -1,0 +1,34 @@
+# scripts/lib/testdata/manifest.test.yml — Fixture test DRY_RUN MIXTE (BK2 multi-moteurs 2026-07-11)
+#
+# Manifest MIXTE 4 cibles (2 postgres + 2 mysql) / 4 containers DISTINCTS — consommé par la
+# matrice DRY_RUN (dispatch per-engine + globals PG + users MySQL + patterns rétention) :
+#   A2K_BACKUP_MANIFEST=scripts/lib/testdata/manifest.test.yml DRY_RUN=1 bash scripts/app-backup.sh stg soiroke
+#
+# ⚠ La cible mysql #3 partage db_name=test_db_one avec la cible pg #1 : valide M1 RELAXÉE
+# per-engine (cross-engine AUTORISÉ — extensions disjointes D1) + lookup catch-up FILTRÉ engine.
+# La cible mysql #4 porte password_env explicite ; la #3 teste le défaut MYSQL_ROOT_PASSWORD.
+#
+# Schéma : docs/contracts/backup-manifest.TEMPLATE.yml (format plat contraint V0).
+# Valeurs DUMMY (aucun container réel) — DRY_RUN only, jamais exécuté contre docker.
+targets:
+  - engine: postgres
+    access: docker
+    container: postgres-test-one
+    db_user: test_one_admin
+    db_name: test_db_one
+  - engine: postgres
+    access: docker
+    container: postgres-test-two
+    db_user: test_two_admin
+    db_name: test_db_two
+  - engine: mysql
+    access: docker
+    container: mysql-test-one
+    db_user: root
+    db_name: test_db_one
+  - engine: mysql
+    access: docker
+    container: mysql-test-two
+    db_user: root
+    db_name: test_db_mysql_two
+    password_env: MYSQL_ROOT_PASSWORD

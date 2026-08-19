@@ -1,0 +1,31 @@
+name: 'Defensive Docker Registry Login'
+description: 'Docker login to registry (GHCR by default) with --password-stdin (no leak via process list). Idempotent re-login OK. Cycle 29 ADR-010 sous-action 2.'
+
+inputs:
+  registry:
+    description: 'Docker registry hostname (default ghcr.io)'
+    required: false
+    default: 'ghcr.io'
+  username:
+    description: 'Registry username (e.g. github.actor for GHCR)'
+    required: true
+  token:
+    description: 'Registry token / password (e.g. GITHUB_TOKEN for GHCR)'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Docker login (--password-stdin anti leak)
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.registry }}
+        USERNAME: ${{ inputs.username }}
+        TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        # Defense-in-depth log masking
+        echo "::add-mask::${TOKEN}"
+        # Use --password-stdin instead of --password arg (avoid process list leak)
+        echo "${TOKEN}" | docker login "${REGISTRY}" -u "${USERNAME}" --password-stdin
+        echo "✓ Docker login OK : ${REGISTRY} as ${USERNAME}"

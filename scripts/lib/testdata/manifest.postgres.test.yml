@@ -1,0 +1,19 @@
+# scripts/lib/testdata/manifest.postgres.test.yml — Fixture test DRY_RUN PG-ONLY (BK2 2026-07-11)
+#
+# Copie des 2 cibles postgres historiques (fixture pré-BK2) — RÉGRESSION pg-only de la matrice
+# DRY_RUN : le run ne doit émettre AUCUNE ligne mysqldump/users MySQL :
+#   A2K_BACKUP_MANIFEST=scripts/lib/testdata/manifest.postgres.test.yml DRY_RUN=1 bash scripts/app-backup.sh stg soiroke
+#
+# Schéma : docs/contracts/backup-manifest.TEMPLATE.yml (format plat contraint V0).
+# Valeurs DUMMY (aucun container réel) — DRY_RUN only, jamais exécuté contre docker.
+targets:
+  - engine: postgres
+    access: docker
+    container: postgres-test-one
+    db_user: test_one_admin
+    db_name: test_db_one
+  - engine: postgres
+    access: docker
+    container: postgres-test-two
+    db_user: test_two_admin
+    db_name: test_db_two

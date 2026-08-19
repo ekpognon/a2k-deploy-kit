@@ -1,0 +1,78 @@
+name: 'Healthcheck Wait Loop'
+description: 'Poll healthcheck endpoint with retry/timeout. Returns success/failure. Cycle 29 ADR-010 sous-action 2.'
+
+inputs:
+  healthcheck_url:
+    description: 'Public endpoint URL post-Traefik (e.g. https://stg.app.example.com/health)'
+    required: true
+  timeout_seconds:
+    description: 'Total timeout in seconds (default 120)'
+    required: false
+    default: '120'
+  interval_seconds:
+    description: 'Polling interval in seconds (default 5)'
+    required: false
+    default: '5'
+  expected_status:
+    description: 'Expected HTTP status code (default 200)'
+    required: false
+    default: '200'
+  max_request_time:
+    description: 'Per-request timeout in seconds (default 5)'
+    required: false
+    default: '5'
+
+outputs:
+  success:
+    description: 'Whether healthcheck succeeded ("true" / "false")'
+    value: ${{ steps.poll.outputs.success }}
+  actual_status:
+    description: 'Last observed HTTP status code'
+    value: ${{ steps.poll.outputs.actual_status }}
+  duration_s:
+    description: 'Total polling duration in seconds'
+    value: ${{ steps.poll.outputs.duration_s }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Poll healthcheck endpoint until expected status OR timeout
+      id: poll
+      shell: bash
+      env:
+        HEALTHCHECK_URL: ${{ inputs.healthcheck_url }}
+        TIMEOUT_S: ${{ inputs.timeout_seconds }}
+        INTERVAL_S: ${{ inputs.interval_seconds }}
+        EXPECTED_STATUS: ${{ inputs.expected_status }}
+        MAX_REQ_TIME: ${{ inputs.max_request_time }}
+      run: |
+        set -euo pipefail
+        start_ts=$(date +%s)
+        max_iterations=$((TIMEOUT_S / INTERVAL_S))
+        actual_status="000"
+        success="false"
+
+        for i in $(seq 1 "${max_iterations}"); do
+          actual_status=$(curl -fsS -o /dev/null -w "%{http_code}" --max-time "${MAX_REQ_TIME}" "${HEALTHCHECK_URL}" || echo "000")
+          if [ "${actual_status}" = "${EXPECTED_STATUS}" ]; then
+            success="true"
+            break
+          fi
+          echo "⏳ Healthcheck iteration ${i}/${max_iterations} HTTP ${actual_status} — sleep ${INTERVAL_S}s"
+          sleep "${INTERVAL_S}"
+        done
+
+        end_ts=$(date +%s)
+        duration_s=$((end_ts - start_ts))
+
+        echo "success=${success}" >> "${GITHUB_OUTPUT}"
+        echo "actual_status=${actual_status}" >> "${GITHUB_OUTPUT}"
+        echo "duration_s=${duration_s}" >> "${GITHUB_OUTPUT}"
+
+        if [ "${success}" = "true" ]; then
+          echo "✓ Healthcheck OK (HTTP ${actual_status}, duration=${duration_s}s)"
+          exit 0
+        else
+          echo "❌ Healthcheck timeout ${TIMEOUT_S}s — last status HTTP ${actual_status}" >&2
+          exit 1
+        fi

@@ -1,0 +1,14 @@
+# scripts/lib/testdata/manifest.invalid.test.yml — Fixture test DRY_RUN ENGINE INVALIDE (BK2 2026-07-11)
+#
+# Cible engine=oracle (hors table ENGINE_REQUIRED_KEYS) — matrice DRY_RUN fail-fast attendu :
+# exit 1 + message enum DYNAMIQUE (clés de la table — e.g. "enum: mysql postgres") :
+#   A2K_BACKUP_MANIFEST=scripts/lib/testdata/manifest.invalid.test.yml DRY_RUN=1 bash scripts/app-backup.sh stg soiroke
+#
+# Schéma : docs/contracts/backup-manifest.TEMPLATE.yml (format plat contraint V0).
+# Valeurs DUMMY (aucun container réel) — DRY_RUN only, jamais exécuté contre docker.
+targets:
+  - engine: oracle
+    access: docker
+    container: oracle-test-one
+    db_user: system
+    db_name: test_db_oracle

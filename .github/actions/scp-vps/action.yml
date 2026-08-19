@@ -1,0 +1,101 @@
+name: 'SCP Transport to VPS'
+description: 'Transport files/dirs to VPS via SCP with anti-TOFU fingerprint pinning. Cycle 29 ADR-010 sous-action 2.'
+
+inputs:
+  ssh_host:
+    description: 'VPS hostname (e.g. stg.example.com)'
+    required: true
+  ssh_user:
+    description: 'SSH user (e.g. deploy / ops)'
+    required: true
+  ssh_fingerprint:
+    description: 'SSH host fingerprint (anti-TOFU pinning). E.g. "stg.example.com ssh-ed25519 AAAA..."'
+    required: true
+  ssh_key:
+    description: 'SSH private key (typically from INFRA_SSH_KEY secret)'
+    required: true
+  source_path:
+    description: 'Local source path (file OR directory if recursive=true)'
+    required: true
+  target_path:
+    description: 'Remote target path on VPS (e.g. /opt/stg/topxpress/scripts/)'
+    required: true
+  recursive:
+    description: 'Recursive transfer (scp -r). Default true.'
+    required: false
+    default: 'true'
+  extra_args:
+    description: 'Additional scp args (e.g. "-p" preserve mode/timestamps)'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup SSH agent + known_hosts (anti-TOFU pinned)
+      shell: bash
+      env:
+        INFRA_SSH_KEY: ${{ inputs.ssh_key }}
+        SSH_FINGERPRINT: ${{ inputs.ssh_fingerprint }}
+      run: |
+        set -euo pipefail
+        # Defense-in-depth log masking SSH key
+        echo "::add-mask::${INFRA_SSH_KEY}"
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+        printf '%s\n' "${INFRA_SSH_KEY}" > ~/.ssh/composite_ops_key
+        chmod 600 ~/.ssh/composite_ops_key
+        printf '%s\n' "${SSH_FINGERPRINT}" >> ~/.ssh/known_hosts
+
+    - name: SCP transport
+      shell: bash
+      env:
+        SSH_USER: ${{ inputs.ssh_user }}
+        SSH_HOST: ${{ inputs.ssh_host }}
+        SOURCE_PATH: ${{ inputs.source_path }}
+        TARGET_PATH: ${{ inputs.target_path }}
+        RECURSIVE: ${{ inputs.recursive }}
+        EXTRA_ARGS: ${{ inputs.extra_args }}
+      run: |
+        set -euo pipefail
+
+        # Sub-action 2 cycle 29 Wave 1 closure 4.5 (Finding B R3S5 conditionnel résolu) +
+        # R1-W1-10 MED Wave 2 §2.5 (allowlist restrict anti -o ProxyCommand injection) :
+        # Restrictive allowlist EXTRA_ARGS — accepte UNIQUEMENT scp flags safe : -p -C -B -q
+        # AVANT (whitelist permissive [a-zA-Z0-9 ._/-]) : allows '-o ProxyCommand=evil' injection
+        # APRES (allowlist restrictive) : -p (preserve), -C (compress), -B (batch), -q (quiet)
+        # Format : dash + single flag char + (space | end), repeated 1+ times.
+        # Validation empirique cycle 29 Wave 2 EXECUTOR : MATCH '-p -C' / '-p' / '-B -p' / '-p -C -B -q' ;
+        #   REJECT '-o ProxyCommand=evil' / '-r ; cmd' / '-p; cmd' (defense-in-depth confirmed).
+        # Trust boundary : cf. DEPLOY-APP-INVOKER-GUIDE.md § Trust Boundary composite actions.
+        if [[ -n "${EXTRA_ARGS}" ]] && ! printf '%s' "${EXTRA_ARGS}" | grep -qE '^(-[pCBq]( +|$))+$'; then
+          echo "::error::EXTRA_ARGS rejected — allowlist: -p -C -B -q only (defense-in-depth anti -o ProxyCommand injection). Got: ${EXTRA_ARGS}"
+          echo "::error::Cf. security-review skill § Input Validation + DEPLOY-APP-INVOKER-GUIDE.md § Trust Boundary"
+          exit 1
+        fi
+
+        RECURSIVE_FLAG=""
+        if [ "${RECURSIVE}" = "true" ]; then
+          RECURSIVE_FLAG="-r"
+        fi
+        # SCP with strict host key checking (anti-TOFU)
+        # R1-W1-09 LOW Wave 2 §2.5 : ${RECURSIVE_FLAG} ${EXTRA_ARGS} intentional word-split (SC2086).
+        # Defense-in-depth : allowlist regex above (restrictive -p -C -B -q only) = PRIMARY defense.
+        # Word-split = functional necessity (multiple flags). If allowlist regression introduced
+        # (e.g. allow ';'), word-split could enable command injection — allowlist regex is the
+        # guard. Defense-in-depth tradeoff documented.
+        # shellcheck disable=SC2086
+        scp -i ~/.ssh/composite_ops_key \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            ${RECURSIVE_FLAG} ${EXTRA_ARGS} \
+            "${SOURCE_PATH}" "${SSH_USER}@${SSH_HOST}:${TARGET_PATH}"
+        echo "✓ SCP transport OK : ${SOURCE_PATH} → ${SSH_USER}@${SSH_HOST}:${TARGET_PATH}"
+
+    - name: Cleanup SSH artifacts
+      if: always()
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -f ~/.ssh/composite_ops_key
+        # Keep known_hosts for subsequent steps in same job (other composite actions may need it)

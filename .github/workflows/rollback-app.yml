@@ -1,0 +1,464 @@
+name: Rollback App (reusable workflow_call)
+
+# Cycle 29 ADR-010 sous-action 4 — workflow réutilisable rollback cross-repo invoker apps consommatrices.
+# Invoque shared `scripts/app-rollback.sh <env> <app_name> <previous_tag>` qui rollback in-place A12
+# (pre-pull last 3 images VPS — ~5s fast rollback sans re-download).
+#
+# Architecture push-and-forget VPS-orchestrator (ADR-004 cycle 12) :
+#   - GHA = transport-only (scp scripts/ shared depuis a2k-shared-infra → VPS, puis ssh exec rollback)
+#   - VPS = orchestrator local autonome (app-rollback.sh runs LOCALLY on VPS post-scp)
+#
+# Concurrency group `app-write-<env>-<app>` shared avec deploy-app.yml + provision-app.yml — anti-race.
+# Pattern A PREREQ fail-fast identique deploy-app.yml (Zone 4 + proxy_net + traefik).
+# A15 SHA pinning strict 100% (cycle 29 supply chain — incidents 2025 tj-actions + Shai Hulud).
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        description: 'Environnement cible (stg | prd)'
+        required: true
+        type: string
+      app_name:
+        description: 'App name (topxpress | soiroke | autre)'
+        required: true
+        type: string
+      previous_tag:
+        description: 'Tag rollback target (must be pre-pulled VPS A12) — e.g. v1.2.2 OR sha-abc123'
+        required: true
+        type: string
+      app_ref:
+        description: 'SHA/ref du caller repo à checkout pour transport artifacts (hooks/ + compose + config). Pattern PRESCRIT du contrat toutes apps (cf. DEPLOY-APP-INVOKER-GUIDE § app_ref) : passer le SHA courant du job amont (post-commits-mid-run). Vide (défaut) = github.sha du déclenchement — toléré transitoire uniquement (rétro-compatible au merge)'
+        required: false
+        type: string
+        default: ''
+      compose_path:
+        description: 'Path relatif app repo vers répertoire compose (e.g. "deploy/" OR ".")'
+        required: false
+        type: string
+        default: '.'
+      healthcheck_url:
+        description: 'Endpoint app /health (validation rollback) — empty skip'
+        required: false
+        type: string
+        default: ''
+      # NOTE Sub-action 3 cycle 29 Wave 1 closure 4.5 (Finding C R3S2 + R1F8) :
+      # Paramètre smoke_test_command SUPPRIMÉ — Mode A user Option 0 cleanup canonical.
+      # Smoke-test post-rollback 100% canonical via hooks/smoke-test.sh A8 V0 OBLIGATOIRE.
+    secrets:
+      DEPLOY_SSH_KEY:
+        required: true
+      A2K_SHARED_INFRA_TOKEN:
+        required: false
+
+concurrency:
+  group: app-write-${{ inputs.env }}-${{ inputs.app_name }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  validate-prereqs:
+    name: Pattern A PREREQ fail-fast (Zone 4 + proxy_net + traefik)
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env }}
+    permissions:
+      contents: read
+    env:
+      TARGET_ENV: ${{ inputs.env }}
+      APP_NAME: ${{ inputs.app_name }}
+    steps:
+      # Cycle37-hotfix (ssh-execute cross-repo fix) : checkout a2k-shared-infra (PAS caller repo)
+      # pour résolution local composite action `./.github/actions/ssh-execute`. En cross-repo
+      # `workflow_call`, `./` résout contre le checkout du CALLER (app repo) où les composite
+      # actions n'existent pas → "Can't find action.yml". Self-checkout `job.workflow_repository`
+      # + `ref: job.workflow_sha` = version-lock immuable au SHA du workflow pinné. Ce job
+      # n'utilise AUCUN artifact caller (que ssh-execute contre VPS) → shared-infra root suffit.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          token: ${{ secrets.A2K_SHARED_INFRA_TOKEN }}
+
+      # Cycle 29 Wave 1 cont sub-action 6 : refactor adoption composite actions.
+      # SSH setup inline DÉLÉGUÉ aux composite actions (ssh-execute + scp-vps internal).
+      - name: Resolve VPS target params (env-specific host + fingerprint selection)
+        env:
+          SSH_HOST_FINGERPRINT_STG: ${{ vars.SSH_HOST_FINGERPRINT_STG }}
+          SSH_HOST_FINGERPRINT_PRD: ${{ vars.SSH_HOST_FINGERPRINT_PRD }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_HOST_STG: ${{ vars.DEPLOY_HOST_STG }}
+          DEPLOY_HOST_PRD: ${{ vars.DEPLOY_HOST_PRD }}
+        run: |
+          set -euo pipefail
+          if [ "${TARGET_ENV}" = "stg" ]; then
+            echo "SSH_HOST=${DEPLOY_HOST_STG}" >> "$GITHUB_ENV"
+            echo "SSH_FINGERPRINT=${SSH_HOST_FINGERPRINT_STG}" >> "$GITHUB_ENV"
+            echo "SSH_USER=${DEPLOY_USER}" >> "$GITHUB_ENV"
+          elif [ "${TARGET_ENV}" = "prd" ]; then
+            echo "SSH_HOST=${DEPLOY_HOST_PRD}" >> "$GITHUB_ENV"
+            echo "SSH_FINGERPRINT=${SSH_HOST_FINGERPRINT_PRD}" >> "$GITHUB_ENV"
+            echo "SSH_USER=${DEPLOY_USER}" >> "$GITHUB_ENV"
+          else
+            echo "❌ TARGET_ENV invalide: ${TARGET_ENV}" >&2
+            exit 1
+          fi
+          echo "✓ VPS target params resolved (env=${TARGET_ENV})"
+
+      - name: Validate inputs regex (anti shell injection F1)
+        env:
+          REMOTE_TAG: ${{ inputs.previous_tag }}
+          REMOTE_APP: ${{ inputs.app_name }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "${REMOTE_TAG}" | grep -qE '^[a-zA-Z0-9._-]{1,128}$'; then
+            echo "❌ previous_tag invalide: ${REMOTE_TAG}" >&2
+            exit 1
+          fi
+          if ! printf '%s' "${REMOTE_APP}" | grep -qE '^[a-z][a-z0-9_-]{0,63}$'; then
+            echo "❌ app_name invalide: ${REMOTE_APP}" >&2
+            exit 1
+          fi
+          echo "✓ inputs regex validation OK"
+
+      - name: Pattern A PREREQ check (3 deps strict — composite ssh-execute)
+        uses: ./.github/actions/ssh-execute
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          command: |
+            set -euo pipefail
+            TARGET_ENV='${{ inputs.env }}' APP_NAME='${{ inputs.app_name }}'
+            docker ps --filter "name=traefik-${TARGET_ENV}" --filter "status=running" --format "{{.Names}}" | grep -q "traefik-${TARGET_ENV}" || {
+              echo "❌ PREREQ FAIL: traefik-${TARGET_ENV} container NOT running." >&2
+              exit 1
+            }
+            docker network inspect proxy_net >/dev/null 2>&1 || {
+              echo "❌ PREREQ FAIL: proxy_net network ABSENT." >&2
+              exit 1
+            }
+            test -f "/etc/${APP_NAME}/${TARGET_ENV}/.env.secrets" || {
+              echo "❌ PREREQ FAIL: Zone 4 secrets /etc/${APP_NAME}/${TARGET_ENV}/.env.secrets ABSENT." >&2
+              exit 1
+            }
+            echo "✓ PREREQ OK rollback context"
+
+  rollback:
+    name: Rollback ${{ inputs.app_name }} → ${{ inputs.env }} (previous tag ${{ inputs.previous_tag }})
+    needs: validate-prereqs
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env }}
+    permissions:
+      contents: read
+    env:
+      TARGET_ENV: ${{ inputs.env }}
+      APP_NAME: ${{ inputs.app_name }}
+      PREVIOUS_TAG: ${{ inputs.previous_tag }}
+    steps:
+      # DA1 2026-07-07 : `ref: inputs.app_ref` — input `ref` de actions/checkout a pour défaut ''
+      # (chaîne vide = résolution défaut github.sha du trigger) → passthrough direct SANS conditionnel,
+      # rétro-compatible strict. app_ref non-vide = SHA post-commits-mid-run du caller (fraîcheur artifacts).
+      - name: Checkout calling app repo (compose_path artifacts)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.app_ref }}
+          path: app-repo
+
+      # Sub-action 4 cycle 29 Wave 1 closure 4.5 (Finding D R2H2 + R3S6) : anti supply chain breach
+      # — pin workflow_sha strict (PAS github.action_ref fallback main mutable).
+      # job.workflow_repository = repo où workflow_call défini (shared-infra source vérité).
+      # job.workflow_sha = SHA workflow_call définition (immutable vs ref mutable main).
+      - name: Checkout a2k-shared-infra repo (shared scripts) — pinned workflow SHA
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: shared-infra
+          token: ${{ secrets.A2K_SHARED_INFRA_TOKEN }}
+
+      # E2E2 ADR-018 (DA2) — Oracle O1 SEUL sur rollback (même piège checkout que deploy).
+      # O3/O4 N/A : rollback-app.yml ne transporte NI .env.config NI compose (seulement scripts
+      # shared + hooks/). Pas de job alerting : opération manuelle supervisée (run regardé par
+      # un humain). rc 1 FAIL abort avant transport ; rc 2 WARN S5 (app_ref vide).
+      # F5 R1 — charset validé AVANT tout usage (lib incluse) + APP_REF_SAFE seule forme
+      # échoée dans les workflow commands (anti injection ::commande:: via newline).
+      - name: Freshness oracle O1 — checkout mechanism
+        env:
+          APP_REF: ${{ inputs.app_ref }}
+        run: |
+          set -euo pipefail
+          APP_REF_SAFE="$(printf '%s' "${APP_REF}" | tr -c 'A-Za-z0-9._/-' '?')"
+          if [ -n "${APP_REF}" ] && [ "${APP_REF_SAFE}" != "${APP_REF}" ]; then
+            echo "::error::[freshness] O1 FAIL — app_ref au format invalide (caractères hors [A-Za-z0-9._/-]) : ${APP_REF_SAFE}"
+            exit 1
+          fi
+          # shellcheck source=scripts/lib/freshness-oracle.sh
+          source shared-infra/scripts/lib/freshness-oracle.sh
+          rc=0
+          freshness_check_checkout app-repo "${APP_REF}" || rc=$?
+          if [ "$rc" -eq 1 ]; then
+            echo "::error::[freshness] O1 FAIL — HEAD app-repo != app_ref (${APP_REF_SAFE}) — rollback abort avant transport"
+            exit 1
+          fi
+          if [ "$rc" -eq 2 ]; then
+            echo "::warning::app_ref vide — invoker non conforme au contrat OU expression cassée (needs.<job>.outputs vide) — cf. DEPLOY-APP-INVOKER-GUIDE § app_ref"
+            echo "⚠ O1 (app_ref vide — non évaluable)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "✅ O1 checkout frais (HEAD == app_ref)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Cycle 29 Wave 1 cont sub-action 6 : refactor adoption composite actions.
+      - name: Resolve VPS target params (env-specific host + fingerprint selection)
+        env:
+          SSH_HOST_FINGERPRINT_STG: ${{ vars.SSH_HOST_FINGERPRINT_STG }}
+          SSH_HOST_FINGERPRINT_PRD: ${{ vars.SSH_HOST_FINGERPRINT_PRD }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_HOST_STG: ${{ vars.DEPLOY_HOST_STG }}
+          DEPLOY_HOST_PRD: ${{ vars.DEPLOY_HOST_PRD }}
+        run: |
+          set -euo pipefail
+          if [ "${TARGET_ENV}" = "stg" ]; then
+            echo "SSH_HOST=${DEPLOY_HOST_STG}" >> "$GITHUB_ENV"
+            echo "SSH_FINGERPRINT=${SSH_HOST_FINGERPRINT_STG}" >> "$GITHUB_ENV"
+            echo "SSH_USER=${DEPLOY_USER}" >> "$GITHUB_ENV"
+          elif [ "${TARGET_ENV}" = "prd" ]; then
+            echo "SSH_HOST=${DEPLOY_HOST_PRD}" >> "$GITHUB_ENV"
+            echo "SSH_FINGERPRINT=${SSH_HOST_FINGERPRINT_PRD}" >> "$GITHUB_ENV"
+            echo "SSH_USER=${DEPLOY_USER}" >> "$GITHUB_ENV"
+          fi
+          echo "✓ VPS target params resolved (env=${TARGET_ENV})"
+
+      # REGDOCK 2026-08-18 (G2) — Transport A2K_REGISTRY_ORG caller → VPS (symétrie deploy-app.yml).
+      # app-rollback.sh consomme get_org() (digest check anti-tampering F2 Phase 4) — sans transport,
+      # défaut 'ekpognon' erroné pour une app d'une autre org GHCR. Absente/vide → défaut inchangé
+      # (NON-RÉGRESSION TopXpress/Soiroke). Whitelist regex AVANT inline SSH (anti injection F1).
+      - name: Resolve + validate registry org (A2K_REGISTRY_ORG caller repo var)
+        env:
+          RAW_REGISTRY_ORG: ${{ vars.A2K_REGISTRY_ORG }}
+        run: |
+          set -euo pipefail
+          REGISTRY_ORG="${RAW_REGISTRY_ORG:-ekpognon}"
+          if ! printf '%s' "${REGISTRY_ORG}" | grep -qE '^[a-z][a-z0-9_-]{0,63}$'; then
+            echo "❌ A2K_REGISTRY_ORG invalide (whitelist ^[a-z][a-z0-9_-]{0,63}$): ${REGISTRY_ORG}" >&2
+            exit 1
+          fi
+          echo "REGISTRY_ORG=${REGISTRY_ORG}" >> "$GITHUB_ENV"
+          echo "✓ registry org resolved: ${REGISTRY_ORG}"
+
+      - name: Ensure remote project dir + scripts/lib + hooks/ subdirs (composite ssh-execute)
+        uses: ./shared-infra/.github/actions/ssh-execute
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          command: |
+            set -euo pipefail
+            # Cycle 37 (ADR-008 amend / ADR-013) — umask 027 : point d'entrée SÉPARÉ (session ssh
+            # fraîche, n'hérite PAS de app-rollback.sh) → umask propre requis AVANT mkdir pour que
+            # scripts/lib + hooks héritent du groupe (setgid Z1) sans être world-readable (ops_discipline §5).
+            umask 027
+            REMOTE_DIR="/opt/${{ inputs.env }}/${{ inputs.app_name }}"
+            mkdir -p "${REMOTE_DIR}/scripts/lib" "${REMOTE_DIR}/hooks"
+            echo "✓ Remote project dir ready"
+
+      # Backup V0 (ADR-015) : app-backup.sh + backup/ manifest NON transportés ici (décision assumée) —
+      # le flow rollback n'invoque pas app-backup.sh (pre-rollback.sh consomme au plus backup-lib.sh,
+      # transportée via lib/ ci-dessous) ; le prochain deploy-app.yml resynchronise script + manifest.
+      - name: Transport shared scripts app-rollback.sh (composite scp-vps)
+        uses: ./shared-infra/.github/actions/scp-vps
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source_path: shared-infra/scripts/app-rollback.sh
+          target_path: /opt/${{ inputs.env }}/${{ inputs.app_name }}/scripts/app-rollback.sh
+          recursive: 'false'
+
+      - name: Transport shared scripts app-deploy.sh (composite scp-vps)
+        uses: ./shared-infra/.github/actions/scp-vps
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source_path: shared-infra/scripts/app-deploy.sh
+          target_path: /opt/${{ inputs.env }}/${{ inputs.app_name }}/scripts/app-deploy.sh
+          recursive: 'false'
+
+      - name: Transport shared lib/ dir (composite scp-vps recursive)
+        uses: ./shared-infra/.github/actions/scp-vps
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source_path: shared-infra/scripts/lib/.
+          target_path: /opt/${{ inputs.env }}/${{ inputs.app_name }}/scripts/lib/
+          recursive: 'true'
+
+      - name: chmod +x shared scripts post-scp (composite ssh-execute)
+        uses: ./shared-infra/.github/actions/ssh-execute
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          command: |
+            set -euo pipefail
+            REMOTE_DIR="/opt/${{ inputs.env }}/${{ inputs.app_name }}"
+            chmod +x "${REMOTE_DIR}/scripts/"*.sh "${REMOTE_DIR}/scripts/lib/"*.sh
+            echo "✓ chmod +x shared scripts OK"
+
+      - name: Detect app hooks/ presence
+        id: detect_hooks
+        env:
+          COMPOSE_PATH: ${{ inputs.compose_path }}
+        run: |
+          set -euo pipefail
+          if [ -d "app-repo/${COMPOSE_PATH}/hooks" ]; then
+            echo "hooks_present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "hooks_present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Transport app hooks/ dir (composite scp-vps conditional)
+        if: steps.detect_hooks.outputs.hooks_present == 'true'
+        uses: ./shared-infra/.github/actions/scp-vps
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source_path: app-repo/${{ inputs.compose_path }}/hooks/.
+          target_path: /opt/${{ inputs.env }}/${{ inputs.app_name }}/hooks/
+          recursive: 'true'
+
+      - name: chmod +x app hooks post-scp (composite ssh-execute conditional)
+        if: steps.detect_hooks.outputs.hooks_present == 'true'
+        uses: ./shared-infra/.github/actions/ssh-execute
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          command: |
+            set -euo pipefail
+            REMOTE_DIR="/opt/${{ inputs.env }}/${{ inputs.app_name }}"
+            chmod +x "${REMOTE_DIR}/hooks/"*.sh
+            echo "✓ chmod +x app hooks OK"
+
+      # REGDOCK 2026-08-18 (A3) — DOCKER_CONFIG scopé PER-APP (fin du last-login-wins
+      # ~/.docker/config.json global). Path déterministe identique deploy-app.yml :
+      # ${HOME}/.docker-a2k/<app>-<env> (0700 deploy) — exporté ICI ET dans le step Execute
+      # (sessions SSH distinctes). Cf. DEPLOY-APP-INVOKER-GUIDE § Docker config scopé per-app.
+      - name: Docker login GHCR sur VPS (pull image privée — composite ssh-execute)
+        uses: ./shared-infra/.github/actions/ssh-execute
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          command: |
+            set -euo pipefail
+            export DOCKER_CONFIG="${HOME}/.docker-a2k/${{ inputs.app_name }}-${{ inputs.env }}"
+            mkdir -p "${DOCKER_CONFIG}"
+            chmod 700 "${HOME}/.docker-a2k" "${DOCKER_CONFIG}"
+            SECRETS_FILE="/etc/${{ inputs.app_name }}/${{ inputs.env }}/.env.secrets"
+            set -a
+            . "${SECRETS_FILE}"
+            set +a
+            : "${GHCR_TOKEN:?GHCR_TOKEN absent de ${SECRETS_FILE}}"
+            printf '%s' "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USERNAME:-${{ github.actor }}}" --password-stdin
+
+      - name: Execute app-rollback.sh local sur VPS (composite ssh-execute)
+        uses: ./shared-infra/.github/actions/ssh-execute
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          timeout_minutes: '15'
+          # REGDOCK (G2) : export A2K_REGISTRY_ORG (env.REGISTRY_ORG whitelist-validée) —
+          # consommée VPS-side par get_org() (digest check F2 Phase 4 app-rollback.sh).
+          # REGDOCK (A3) : export DOCKER_CONFIG scopé — MÊME path que le step login (sessions
+          # SSH distinctes) → compose pull Phase 4 lit la cred per-app.
+          command: |
+            export A2K_REGISTRY_ORG='${{ env.REGISTRY_ORG }}'
+            export DOCKER_CONFIG="${HOME}/.docker-a2k/${{ inputs.app_name }}-${{ inputs.env }}"
+            bash /opt/${{ inputs.env }}/${{ inputs.app_name }}/scripts/app-rollback.sh '${{ inputs.env }}' '${{ inputs.app_name }}' '${{ inputs.previous_tag }}'
+
+  healthcheck-wait:
+    name: Healthcheck wait post-rollback (timeout 120s)
+    needs: rollback
+    runs-on: ubuntu-latest
+    if: inputs.healthcheck_url != ''
+    permissions:
+      contents: read
+    steps:
+      # Cycle 29 Wave 1 cont sub-action 6 : refactor adoption composite action healthcheck-wait.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          token: ${{ secrets.A2K_SHARED_INFRA_TOKEN }}
+
+      - name: Poll healthcheck endpoint (composite healthcheck-wait)
+        uses: ./.github/actions/healthcheck-wait
+        with:
+          healthcheck_url: ${{ inputs.healthcheck_url }}
+          timeout_seconds: '120'
+          interval_seconds: '2'
+          expected_status: '200'
+          max_request_time: '5'
+
+  # NOTE Sub-action 3 cycle 29 Wave 1 closure 4.5 (Finding C R3S2 + R1F8) :
+  # Job smoke-test SUPPRIMÉ — Mode A user Option 0 cleanup canonical.
+  # Smoke-test post-rollback 100% canonical via hooks/smoke-test.sh A8 V0 OBLIGATOIRE.
+
+  summary:
+    name: Summary report
+    needs: [validate-prereqs, rollback, healthcheck-wait]
+    runs-on: ubuntu-latest
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - name: Build summary
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          TARGET_ENV: ${{ inputs.env }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+          PREREQ_STATUS: ${{ needs.validate-prereqs.result }}
+          ROLLBACK_STATUS: ${{ needs.rollback.result }}
+          HEALTHCHECK_STATUS: ${{ needs.healthcheck-wait.result }}
+          TRIGGERED_BY: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Rollback App — ${APP_NAME} → ${TARGET_ENV} (previous tag ${PREVIOUS_TAG})"
+            echo ""
+            echo "- **Mode** : reusable workflow_call (cycle 29 ADR-010 A12 in-place + pre-pull last 3)"
+            echo "- **App name** : ${APP_NAME}"
+            echo "- **Env** : ${TARGET_ENV}"
+            echo "- **Previous tag** : ${PREVIOUS_TAG}"
+            echo "- **Triggered by** : ${TRIGGERED_BY}"
+            echo ""
+            echo "### Jobs status"
+            echo ""
+            echo "| Job | Status |"
+            echo "|---|---|"
+            echo "| validate-prereqs (Pattern A) | ${PREREQ_STATUS} |"
+            echo "| rollback (transport + execute app-rollback.sh) | ${ROLLBACK_STATUS} |"
+            echo "| healthcheck-wait | ${HEALTHCHECK_STATUS} |"
+            echo ""
+            echo "### Cross-refs"
+            echo ""
+            echo "- ADR-010 (cycle 29 shared deploy architecture A12 rollback in-place + pre-pull last 3)"
+            echo "- \`scripts/app-rollback.sh\` (shared core cycle 29)"
+            echo "- \`docs/runbooks/deep-rollback-from-git-tag.md\` (A14 — fallback si image absente registry post-cleanup)"
+          } >> "$GITHUB_STEP_SUMMARY"

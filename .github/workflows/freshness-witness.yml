@@ -1,0 +1,142 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# freshness-witness.yml — job témoin oracles fraîcheur (E2E2 ADR-018, option b-micro)
+#
+# Valide la LOGIQUE des oracles scripts/lib/freshness-oracle.sh sur fixtures git
+# LOCALES ($RUNNER_TEMP) — secondes, sans VPS/ssh/docker. Anti-faux-verts : le cas
+# S3 stale DOIT rendre rc 1 (test du test — s'il rend 0, le harnais est cassé et
+# les oracles O1 des workflows deploy/rollback ne détecteraient rien).
+#
+# Workflow DÉDIÉ (DA7) — infra-tnr.yml = scope molecule/Ansible, mauvais outil.
+# A15 : checkout SHA-pinné + permissions: {} top-level, contents: read job only.
+# ─────────────────────────────────────────────────────────────────────────────
+name: Freshness witness (fixtures locales)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/lib/freshness-oracle.sh'
+      - '.github/workflows/deploy-app.yml'
+      - '.github/workflows/rollback-app.yml'
+      - '.github/workflows/freshness-witness.yml'
+  pull_request:
+    paths:
+      - 'scripts/lib/freshness-oracle.sh'
+      - '.github/workflows/deploy-app.yml'
+      - '.github/workflows/rollback-app.yml'
+      - '.github/workflows/freshness-witness.yml'
+
+permissions: {}
+
+jobs:
+  witness:
+    name: Witness oracles (10 cas rc exacts)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - name: Run witness cases (fixtures git locales)
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/lib/freshness-oracle.sh
+          source scripts/lib/freshness-oracle.sh
+
+          PASS=0
+          TOTAL=0
+
+          # assert_rc <cas> <expected_rc> <actual_rc> — échec = exit 1 message du cas.
+          assert_rc() {
+            TOTAL=$((TOTAL + 1))
+            if [ "$3" -ne "$2" ]; then
+              echo "::error::[witness] cas '$1' : rc attendu $2, obtenu $3 — harnais/oracle cassé"
+              exit 1
+            fi
+            PASS=$((PASS + 1))
+            echo "[witness] cas '$1' OK (rc $3)"
+          }
+
+          # ── Fixture git locale : commit N-1 (v0.0.1) puis commit bump (v0.0.2) ──
+          FIXTURE="${RUNNER_TEMP}/freshness-fixture"
+          rm -rf "${FIXTURE}"
+          mkdir -p "${FIXTURE}"
+          git -C "${FIXTURE}" init -q
+          git -C "${FIXTURE}" config user.email "witness@a2k.invalid"
+          git -C "${FIXTURE}" config user.name "freshness-witness"
+          printf 'APP_VERSION=v0.0.1\n' > "${FIXTURE}/.env.config"
+          git -C "${FIXTURE}" add .env.config
+          git -C "${FIXTURE}" commit -qm "fixture: N-1 (v0.0.1)"
+          SHA_N1="$(git -C "${FIXTURE}" rev-parse HEAD)"
+          printf 'APP_VERSION=v0.0.2\n' > "${FIXTURE}/.env.config"
+          git -C "${FIXTURE}" add .env.config
+          git -C "${FIXTURE}" commit -qm "fixture: bump (v0.0.2)"
+          SHA_BUMP="$(git -C "${FIXTURE}" rev-parse HEAD)"
+
+          # S1 frais : worktree au commit bump, ref = SHA bump → rc 0
+          rc=0
+          freshness_check_checkout "${FIXTURE}" "${SHA_BUMP}" || rc=$?
+          assert_rc "S1 frais" 0 "$rc"
+
+          # S3 stale (TEST DU TEST) : worktree au commit N-1, ref = SHA bump → rc 1 EXIGÉ
+          git -C "${FIXTURE}" checkout -q "${SHA_N1}"
+          rc=0
+          freshness_check_checkout "${FIXTURE}" "${SHA_BUMP}" || rc=$?
+          assert_rc "S3 stale (test du test)" 1 "$rc"
+
+          # S4 ref inexistante : SHA 40 hex bidon → rc 1
+          rc=0
+          freshness_check_checkout "${FIXTURE}" "0123456789abcdef0123456789abcdef01234567" || rc=$?
+          assert_rc "S4 ref inexistante" 1 "$rc"
+
+          # S5 ref vide '' → rc 2 (WARN app_ref non fourni)
+          rc=0
+          freshness_check_checkout "${FIXTURE}" "" || rc=$?
+          assert_rc "S5 ref vide" 2 "$rc"
+
+          # Drift match : fichier bump (v0.0.2), tag v0.0.2 → rc 0
+          git -C "${FIXTURE}" checkout -q "${SHA_BUMP}"
+          rc=0
+          freshness_check_tag_drift "${FIXTURE}/.env.config" "v0.0.2" || rc=$?
+          assert_rc "Drift match" 0 "$rc"
+
+          # Drift stale : fichier N-1 (v0.0.1), tag v0.0.2 → rc 2
+          git -C "${FIXTURE}" checkout -q "${SHA_N1}"
+          rc=0
+          freshness_check_tag_drift "${FIXTURE}/.env.config" "v0.0.2" || rc=$?
+          assert_rc "Drift stale" 2 "$rc"
+
+          # Clé absente : fichier sans *_VERSION → rc 2
+          printf 'SOME_KEY=value\n' > "${RUNNER_TEMP}/no-version.env"
+          rc=0
+          freshness_check_tag_drift "${RUNNER_TEMP}/no-version.env" "v0.0.2" || rc=$?
+          assert_rc "Clé absente" 2 "$rc"
+
+          # Fichier absent : path inexistant → rc 1
+          rc=0
+          freshness_check_tag_drift "${RUNNER_TEMP}/does-not-exist.env" "v0.0.2" || rc=$?
+          assert_rc "Fichier absent" 1 "$rc"
+
+          # CRLF (F3 R1 MED — couvre le strip CR commit 7a0d736 en CI) : fichier avec fins
+          # de ligne \r\n (édité Windows / git autocrlf) → rc 0 attendu. Sans le strip
+          # `line="${line%$'\r'}"` de la lib, la valeur embarquerait un \r invisible →
+          # faux WARN rc 2 : ce cas échouerait (régression du strip = rouge immédiat).
+          printf 'APP_VERSION=v0.0.2\r\n' > "${RUNNER_TEMP}/crlf.env"
+          rc=0
+          freshness_check_tag_drift "${RUNNER_TEMP}/crlf.env" "v0.0.2" || rc=$?
+          assert_rc "CRLF strip (fins de ligne Windows)" 0 "$rc"
+
+          # sha256 : freshness_file_sha256 == sha256sum direct
+          expected="$(sha256sum "${FIXTURE}/.env.config")"
+          expected="${expected%% *}"
+          actual="$(freshness_file_sha256 "${FIXTURE}/.env.config")"
+          TOTAL=$((TOTAL + 1))
+          if [ "${actual}" != "${expected}" ]; then
+            echo "::error::[witness] cas 'sha256' : ${actual} != ${expected}"
+            exit 1
+          fi
+          PASS=$((PASS + 1))
+          echo "[witness] cas 'sha256' OK"
+
+          echo "## Freshness witness — ${PASS}/${TOTAL} PASS ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "[witness] ${PASS}/${TOTAL} PASS"

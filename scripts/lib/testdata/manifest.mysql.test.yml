@@ -1,0 +1,24 @@
+# scripts/lib/testdata/manifest.mysql.test.yml — Fixture test DRY_RUN MYSQL-ONLY (BK2 2026-07-11)
+#
+# 2 cibles mysql / 2 containers DISTINCTS — matrice DRY_RUN mysql-only : lignes
+# `sh -c 'exec mysqldump …'` avec littéral -p"$MYSQL_ROOT_PASSWORD" NON expansé + users-dump
+# 1× par container + patterns rétention .mysql.sql :
+#   A2K_BACKUP_MANIFEST=scripts/lib/testdata/manifest.mysql.test.yml DRY_RUN=1 bash scripts/app-backup.sh stg soiroke
+#
+# Cible #1 : password_env EXPLICITE (MYSQL_ROOT_PASSWORD) ; cible #2 : SANS password_env
+# (valide le défaut D2 MYSQL_ROOT_PASSWORD — convention image officielle).
+#
+# Schéma : docs/contracts/backup-manifest.TEMPLATE.yml (format plat contraint V0).
+# Valeurs DUMMY (aucun container réel) — DRY_RUN only, jamais exécuté contre docker.
+targets:
+  - engine: mysql
+    access: docker
+    container: mysql-test-one
+    db_user: root
+    db_name: test_db_mysql_one
+    password_env: MYSQL_ROOT_PASSWORD
+  - engine: mysql
+    access: docker
+    container: mysql-test-two
+    db_user: root
+    db_name: test_db_mysql_two

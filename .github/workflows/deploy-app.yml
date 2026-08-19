@@ -1,0 +1,963 @@
+name: Deploy App (reusable workflow_call)
+
+# Phase E+1-bis cycle 26 (ADR-008 K1 architecture per-app deploy — amend cycle 12 push-and-forget) —
+# Cycle 29 ADR-010 — Famille 1 GHA-native B+C hybride : shared scripts in a2k-shared-infra/scripts/
+# transported to VPS via scp (shared scripts/app-deploy.sh + app-rollback.sh + lib/) puis exec sur VPS.
+# Apps consommatrices N'ONT PLUS BESOIN de deploy.sh (legacy deploy.sh.template SUPPRIMÉ cycle 29).
+#
+# Reusable workflow GHA invoque depuis app repos (TopXpress + Soiroke + futures briques SI A2K) via
+# `uses: ekpognon/a2k-shared-infra/.github/workflows/deploy-app.yml@<sha>` + `secrets: inherit`.
+#
+# Architecture push-and-forget VPS-orchestrator strict (ADR-004 cycle 12 — cohérent
+# .github/workflows/deploy.yml shared Traefik référence) :
+#   - GHA = transport-only (scp scripts/ + docker-compose.yml + config/<env>/.env.config → VPS,
+#     puis ssh "bash /opt/<env>/<app>/scripts/deploy.sh <env>")
+#   - VPS = orchestrator local autonome (deploy.sh app-side s'exécute LOCALEMENT sur VPS post-scp)
+#   - Scripts sync auto via scp (résout user pain "si un script est mis à jour il faut qu'on le
+#     redépose manuellement")
+#   - Admin VPS autonomy : `bash deploy.sh <env>` manuel post-cutover, debugging direct VPS
+#   - SSH heredoc DISPARAÎT by design (cohérent ADR-004 R2-F8 cycle 9c MED résolu structurellement)
+#
+# Docker login défensif anti-logout (cycle E+1-bis user verbatim 2026-06-15) — `docker login` step
+# côté VPS dans deploy.sh idempotent. Si registry Private (ghcr.io Private) → ce login est
+# pré-requis `docker compose pull`. Si déjà loggé → re-login silencieux (anti-logout par
+# inadvertance).
+#
+# Pattern A PREREQ fail-fast (cf. ADR-008 §Decision point 4) — validation Zone 4 secrets
+# + proxy_net + shared Traefik container running AVANT deploy. Fail-fast clair error
+# message si dependances manquantes — user trigger upstream provisioning manuellement
+# (`provision-app.yml` Phase E OR `infra-bootstrap-vps.yml` Phase D).
+#
+# Pattern symetrique provision-app.yml Phase E + infra-bootstrap-vps.yml Phase D —
+# HIGH+MED fixes applies pattern-wide coherent (H1 printf + H2 fail-fast + H3 chmod 700
+# + H4 bash array + M1 cache (N/A no Ansible) + M3 cleanup + M4 add-mask + M5 SHA-pin
+# + M8 pip pin (N/A no Python) + M9 lowercase).
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        description: 'Environnement cible (stg | prd)'
+        required: true
+        type: string  # workflow_call ne supporte PAS choice — string + fail-fast validation H2
+      app_name:
+        description: 'App name (topxpress | soiroke | autre)'
+        required: true
+        type: string
+      container_image_tag:
+        description: 'Container image tag — semver v1.2.3 OR commit SHA 40 chars (anti :latest §2)'
+        required: true
+        type: string
+      app_ref:
+        description: 'SHA/ref du caller repo à checkout pour transport artifacts (hooks/ + compose + config). Pattern PRESCRIT du contrat toutes apps (cf. DEPLOY-APP-INVOKER-GUIDE § app_ref) : passer le SHA courant du job amont (post-commits-mid-run). Vide (défaut) = github.sha du déclenchement — toléré transitoire uniquement (rétro-compatible au merge)'
+        required: false
+        type: string
+        default: ''
+      compose_path:
+        description: 'Path relatif app repo vers répertoire compose (e.g. "deploy/" OR ".") — contient scripts/ + docker-compose.yml + config/<env>/.env.config'
+        required: false
+        type: string
+        default: '.'
+      healthcheck_url:
+        description: 'Endpoint app /health (e.g. https://stg.topxpress.example/health) — empty skip'
+        required: false
+        type: string
+        default: ''
+      # NOTE Sub-action 3 cycle 29 Wave 1 closure 4.5 (Finding C R3S2 + R1F8) :
+      # Paramètre smoke_test_command SUPPRIMÉ — Mode A user Option 0 cleanup canonical.
+      # Smoke-test 100% canonical via 6e hook fichier hooks/smoke-test.sh OBLIGATOIRE V0 A8 amend.
+      # Cf. ADR-010 § A8 amend + DEPLOY-APP-INVOKER-GUIDE.md § Hooks contract 6 hooks.
+      rollback_on_fail:
+        description: 'Rollback conditional si healthcheck OR smoke fail (default true)'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      DEPLOY_SSH_KEY:
+        required: true
+      A2K_SHARED_INFRA_TOKEN:
+        required: false
+      # E2E2 ADR-018 (DA3) — alerting freshness canal mail Brevo SMTP (best-effort).
+      # Optionnels : non câblés → step mail skip graceful (::notice::). Recommandé org-level
+      # (couvre TopXpress + Soiroke en 1 setup) — câblage valeurs user-driven, jamais dans le repo.
+      BREVO_SMTP_USER:
+        required: false
+      BREVO_SMTP_KEY:
+        required: false
+      # NOTE: `secrets: inherit` cote invoker app repo propage automatiquement.
+      # Reusable workflow GHA limitation : secrets: inherit chain max 1 niveau (ADR-008 Risk 2).
+
+# Concurrency group cross-workflow unified `app-write-<env>-<app>` : shared avec provision-app.yml
+# pour coordonner provision+deploy meme env+app (anti race Ansible roles + container restart).
+# cancel-in-progress=false FIFO preserve audit trail sequentiel per env+app.
+# M3 decision Mode A : `infra-bootstrap-vps.yml` conserve `infra-bootstrap-<env>` distinct (scope VPS-wide).
+concurrency:
+  group: app-write-${{ inputs.env }}-${{ inputs.app_name }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  validate-prereqs:
+    name: Pattern A PREREQ fail-fast (Zone 4 + proxy_net + traefik)
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env }}
+    permissions:
+      contents: read
+    env:
+      TARGET_ENV: ${{ inputs.env }}
+      APP_NAME: ${{ inputs.app_name }}
+    steps:
+      # Cycle37-hotfix (ssh-execute cross-repo fix) : checkout a2k-shared-infra (PAS caller repo)
+      # pour résolution local composite action `./.github/actions/ssh-execute`. En cross-repo
+      # `workflow_call`, `./` résout contre le checkout du CALLER (app repo) où les composite
+      # actions n'existent pas → "Can't find action.yml". Self-checkout `job.workflow_repository`
+      # + `ref: job.workflow_sha` = version-lock immuable au SHA du workflow pinné (zéro skew
+      # supply-chain, zéro expression dans `uses:`). Ce job n'utilise AUCUN artifact caller
+      # (que ssh-execute contre VPS) → shared-infra root suffit.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          token: ${{ secrets.A2K_SHARED_INFRA_TOKEN }}
+
+      # Cycle 29 Wave 1 cont sub-action 6 (Mode A user 2026-06-22) :
+      # Refactor adoption composite actions — SSH setup inline ~50L remplacé par composite
+      # action invocations (scp-vps + ssh-execute) qui gèrent SSH key + known_hosts INTERNAL.
+      # Step lightweight pre-composite : resolve env-specific host/fingerprint vars uniquement.
+      - name: Resolve VPS target params (env-specific host + fingerprint selection)
+        env:
+          SSH_HOST_FINGERPRINT_STG: ${{ vars.SSH_HOST_FINGERPRINT_STG }}
+          SSH_HOST_FINGERPRINT_PRD: ${{ vars.SSH_HOST_FINGERPRINT_PRD }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_HOST_STG: ${{ vars.DEPLOY_HOST_STG }}
+          DEPLOY_HOST_PRD: ${{ vars.DEPLOY_HOST_PRD }}
+        run: |
+          set -euo pipefail
+          # H2 fail-fast TARGET_ENV invalide (defense-in-depth — workflow_call type string
+          # ne supporte PAS choice constraint, safety net necessaire).
+          if [ "${TARGET_ENV}" = "stg" ]; then
+            echo "SSH_HOST=${DEPLOY_HOST_STG}" >> "$GITHUB_ENV"
+            echo "SSH_FINGERPRINT=${SSH_HOST_FINGERPRINT_STG}" >> "$GITHUB_ENV"
+            echo "SSH_USER=${DEPLOY_USER}" >> "$GITHUB_ENV"
+          elif [ "${TARGET_ENV}" = "prd" ]; then
+            echo "SSH_HOST=${DEPLOY_HOST_PRD}" >> "$GITHUB_ENV"
+            echo "SSH_FINGERPRINT=${SSH_HOST_FINGERPRINT_PRD}" >> "$GITHUB_ENV"
+            echo "SSH_USER=${DEPLOY_USER}" >> "$GITHUB_ENV"
+          else
+            echo "❌ TARGET_ENV invalide: ${TARGET_ENV}" >&2
+            exit 1
+          fi
+          echo "✓ VPS target params resolved (env=${TARGET_ENV})"
+
+      - name: Validate inputs regex (anti shell injection F1)
+        env:
+          REMOTE_TAG: ${{ inputs.container_image_tag }}
+          REMOTE_APP: ${{ inputs.app_name }}
+        run: |
+          set -euo pipefail
+          # F1 HIGH defense-in-depth : whitelist regex stricte AVANT propagation env var SSH heredoc.
+          # Whitelist semver (v1.2.3 / 1.2.3-rc1) + commit SHA 40 chars + tag alphanum/dot/dash/underscore.
+          if ! printf '%s' "${REMOTE_TAG}" | grep -qE '^[a-zA-Z0-9._-]{1,128}$'; then
+            echo "❌ container_image_tag invalide (whitelist [a-zA-Z0-9._-]{1,128}): ${REMOTE_TAG}" >&2
+            exit 1
+          fi
+          # App name strict lowercase + dash + underscore (DNS-safe + filesystem-safe).
+          if ! printf '%s' "${REMOTE_APP}" | grep -qE '^[a-z][a-z0-9_-]{0,63}$'; then
+            echo "❌ app_name invalide (whitelist ^[a-z][a-z0-9_-]{0,63}$): ${REMOTE_APP}" >&2
+            exit 1
+          fi
+          echo "✓ inputs regex validation OK"
+
+      # Cycle 29 Wave 1 cont sub-action 6 : composite action ssh-execute (cycle 29 ADR-010
+      # sous-action 2). Composite handles SSH key + known_hosts setup INTERNAL + cleanup post-step.
+      # Trust boundary : command hardcoded (PAS user-controlled input direct — cf. ssh-execute action.yml
+      # § Trust Boundary + DEPLOY-APP-INVOKER-GUIDE.md § Trust Boundary Composite Actions).
+      - name: Pattern A PREREQ check (3 deps strict — composite ssh-execute)
+        uses: ./.github/actions/ssh-execute
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          # Trust boundary : env vars TARGET_ENV + APP_NAME propagés via SSH command env injection.
+          # Whitelist regex validation déjà appliquée step précédent — TARGET_ENV stg|prd + APP_NAME [a-z][a-z0-9_-]{0,63}.
+          command: |
+            set -euo pipefail
+            TARGET_ENV='${{ inputs.env }}' APP_NAME='${{ inputs.app_name }}'
+            docker ps --filter "name=traefik-${TARGET_ENV}" --filter "status=running" --format "{{.Names}}" | grep -q "traefik-${TARGET_ENV}" || {
+              echo "❌ PREREQ FAIL: traefik-${TARGET_ENV} container NOT running. Trigger upstream: gh workflow run deploy.yml (a2k-shared-infra) env=${TARGET_ENV}" >&2
+              exit 1
+            }
+            docker network inspect proxy_net >/dev/null 2>&1 || {
+              echo "❌ PREREQ FAIL: proxy_net network ABSENT. Trigger upstream: gh workflow run infra-bootstrap-vps.yml (a2k-shared-infra) env=${TARGET_ENV} dry_run=false" >&2
+              exit 1
+            }
+            test -f "/etc/${APP_NAME}/${TARGET_ENV}/.env.secrets" || {
+              echo "❌ PREREQ FAIL: Zone 4 secrets /etc/${APP_NAME}/${TARGET_ENV}/.env.secrets ABSENT. Trigger upstream: gh workflow run provision-app.yml (a2k-shared-infra) env=${TARGET_ENV} app_name=${APP_NAME} dry_run=false" >&2
+              exit 1
+            }
+            echo "✓ PREREQ OK : traefik running + proxy_net present + Zone 4 secrets pose"
+
+  deploy:
+    name: Deploy ${{ inputs.app_name }} → ${{ inputs.env }} (tag ${{ inputs.container_image_tag }})
+    needs: validate-prereqs
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env }}
+    permissions:
+      contents: read
+    # E2E2 ADR-018 — outputs freshness consommés par le job freshness-alert (best-effort).
+    # F1 R1 HIGH — deploy_executed : marker posé juste AVANT l'exécution VPS réelle
+    # (app-deploy.sh). Gate le job rollback legacy : un échec PRÉ-execute (O1 pré-transport,
+    # O3 post-scp, docker login, tout échec transport) ne doit PAS déclencher
+    # app-rollback.sh :previous sur une app SAINE qui tourne (downgrade spurieux N-1→N-2 —
+    # rien n'a été déployé, l'alias :previous pointe N-2 après la rotation du dernier deploy OK).
+    outputs:
+      freshness_warn: ${{ steps.freshness_outcome.outputs.warn }}
+      freshness_reasons: ${{ steps.freshness_outcome.outputs.reasons }}
+      deploy_executed: ${{ steps.deploy_execution_marker.outputs.executed }}
+    env:
+      TARGET_ENV: ${{ inputs.env }}
+      APP_NAME: ${{ inputs.app_name }}
+      # M9 lowercase canonical. Anti shell injection : input propage via env var, PAS inline ${{ inputs.* }} dans run:
+      # (coherent security-review skill § Input Validation + § Sensitive Data Exposure).
+      TARGET_TAG: ${{ inputs.container_image_tag }}
+    steps:
+      # Cycle E+1-bis NEW : checkout CALLING-REPO context (via `repository: ${{ github.repository }}`)
+      # pour accès artifacts compose_path app repo (hooks/ + docker-compose.yml + config/<env>/.env.config).
+      # workflow_call héredite contexte invoker — github.repository = app repo (TopXpress/Soiroke/autre).
+      # Cycle 29 ADR-010 : apps fournissent désormais hooks/*.sh (file convention A7), PAS deploy.sh.
+      # DA1 2026-07-07 : `ref: inputs.app_ref` — input `ref` de actions/checkout a pour défaut ''
+      # (chaîne vide = résolution défaut github.sha du trigger) → passthrough direct SANS conditionnel,
+      # rétro-compatible strict. app_ref non-vide = SHA post-commits-mid-run du caller (fraîcheur artifacts).
+      - name: Checkout calling app repo (compose_path artifacts)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.app_ref }}
+          path: app-repo
+
+      # Cycle 29 NEW : checkout a2k-shared-infra repo pour shared scripts/ (cycle 29 ADR-010 Famille 1)
+      # Sub-action 4 cycle 29 Wave 1 closure 4.5 (Finding D R2H2 + R3S6) : anti supply chain breach
+      # — pin workflow_sha strict (PAS github.action_ref fallback main mutable).
+      # job.workflow_repository = repo où workflow_call défini (shared-infra source vérité).
+      # job.workflow_sha = SHA workflow_call définition (immutable vs ref mutable main).
+      # Defense-in-depth : empêche calling repo de pointer ref malicious-branch via fallback.
+      - name: Checkout a2k-shared-infra repo (shared scripts) — pinned workflow SHA
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: shared-infra
+          token: ${{ secrets.A2K_SHARED_INFRA_TOKEN }}
+
+      # E2E2 ADR-018 — Oracle O1 fraîcheur checkout caller : HEAD app-repo/ == app_ref demandé.
+      # rc 0 PASS / rc 1 FAIL (checkout stale/divergent — abort AVANT tout transport) /
+      # rc 2 WARN (app_ref vide '' S5 — invoker non conforme au contrat, fallback github.sha).
+      # APP_REF propagé via env: (PAS ${{ }} inline dans run: — anti shell injection).
+      # F5 R1 — charset validé AVANT tout usage (lib incluse) : un app_ref avec newline
+      # pourrait injecter des lignes ::commande:: dans le log runner. APP_REF_SAFE
+      # (hors-whitelist → '?') est la seule forme échoée dans les workflow commands.
+      - name: Freshness oracle O1 — checkout mechanism
+        env:
+          APP_REF: ${{ inputs.app_ref }}
+        run: |
+          set -euo pipefail
+          APP_REF_SAFE="$(printf '%s' "${APP_REF}" | tr -c 'A-Za-z0-9._/-' '?')"
+          if [ -n "${APP_REF}" ] && [ "${APP_REF_SAFE}" != "${APP_REF}" ]; then
+            echo "::error::[freshness] O1 FAIL — app_ref au format invalide (caractères hors [A-Za-z0-9._/-]) : ${APP_REF_SAFE}"
+            exit 1
+          fi
+          # shellcheck source=scripts/lib/freshness-oracle.sh
+          source shared-infra/scripts/lib/freshness-oracle.sh
+          rc=0
+          freshness_check_checkout app-repo "${APP_REF}" || rc=$?
+          if [ "$rc" -eq 1 ]; then
+            echo "::error::[freshness] O1 FAIL — HEAD app-repo != app_ref (${APP_REF_SAFE}) — deploy abort avant transport"
+            exit 1
+          fi
+          if [ "$rc" -eq 2 ]; then
+            echo "::warning::app_ref vide — invoker non conforme au contrat OU expression cassée (needs.<job>.outputs vide) — cf. DEPLOY-APP-INVOKER-GUIDE § app_ref"
+            echo "FRESHNESS_WARN=true" >> "$GITHUB_ENV"
+            echo "FRESHNESS_WARN_REASONS=${FRESHNESS_WARN_REASONS:-}${FRESHNESS_WARN_REASONS:+ | }O1 app_ref vide (checkout non évaluable)" >> "$GITHUB_ENV"
+            echo "⚠ O1 (app_ref vide — non évaluable)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "✅ O1 checkout frais (HEAD == app_ref)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Cycle 29 Wave 1 cont sub-action 6 : refactor adoption composite actions.
+      # SSH setup inline (mkdir + printf + chmod + fingerprint) DÉLÉGUÉ aux composite actions
+      # (ssh-execute + scp-vps internal). Step lightweight resolve env-specific host vars only.
+      - name: Resolve VPS target params (env-specific host + fingerprint selection)
+        env:
+          SSH_HOST_FINGERPRINT_STG: ${{ vars.SSH_HOST_FINGERPRINT_STG }}
+          SSH_HOST_FINGERPRINT_PRD: ${{ vars.SSH_HOST_FINGERPRINT_PRD }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_HOST_STG: ${{ vars.DEPLOY_HOST_STG }}
+          DEPLOY_HOST_PRD: ${{ vars.DEPLOY_HOST_PRD }}
+        run: |
+          set -euo pipefail
+          if [ "${TARGET_ENV}" = "stg" ]; then
+            echo "SSH_HOST=${DEPLOY_HOST_STG}" >> "$GITHUB_ENV"
+            echo "SSH_FINGERPRINT=${SSH_HOST_FINGERPRINT_STG}" >> "$GITHUB_ENV"
+            echo "SSH_USER=${DEPLOY_USER}" >> "$GITHUB_ENV"
+          elif [ "${TARGET_ENV}" = "prd" ]; then
+            echo "SSH_HOST=${DEPLOY_HOST_PRD}" >> "$GITHUB_ENV"
+            echo "SSH_FINGERPRINT=${SSH_HOST_FINGERPRINT_PRD}" >> "$GITHUB_ENV"
+            echo "SSH_USER=${DEPLOY_USER}" >> "$GITHUB_ENV"
+          else
+            echo "❌ TARGET_ENV invalide: ${TARGET_ENV}" >&2
+            exit 1
+          fi
+          echo "✓ VPS target params resolved (env=${TARGET_ENV})"
+
+      - name: Validate inputs regex (anti shell injection F1)
+        env:
+          REMOTE_TAG: ${{ inputs.container_image_tag }}
+          REMOTE_APP: ${{ inputs.app_name }}
+        run: |
+          set -euo pipefail
+          # F1 HIGH symetrie defense-in-depth job `deploy` — meme whitelist regex job `validate-prereqs`.
+          if ! printf '%s' "${REMOTE_TAG}" | grep -qE '^[a-zA-Z0-9._-]{1,128}$'; then
+            echo "❌ container_image_tag invalide (whitelist [a-zA-Z0-9._-]{1,128}): ${REMOTE_TAG}" >&2
+            exit 1
+          fi
+          if ! printf '%s' "${REMOTE_APP}" | grep -qE '^[a-z][a-z0-9_-]{0,63}$'; then
+            echo "❌ app_name invalide (whitelist ^[a-z][a-z0-9_-]{0,63}$): ${REMOTE_APP}" >&2
+            exit 1
+          fi
+          echo "✓ inputs regex validation OK"
+
+      # REGDOCK 2026-08-18 (G2) — Transport A2K_REGISTRY_ORG caller → VPS.
+      # La var contrat EXISTE VPS-side (lib/env-vars.sh 11e var A6 amend) MAIS n'était PAS
+      # transportée depuis le caller → get_org() retombait sur le défaut 'ekpognon' pour les
+      # apps d'une autre org GHCR (Phase 3 pre-pull + Phase 9 rotation alias app-deploy.sh).
+      # Source : var repo caller `vars.A2K_REGISTRY_ORG` (contexte `vars` des reusable
+      # workflows = repo caller — même mécanique que DEPLOY_USER / DEPLOY_HOST_*).
+      # Absente/vide → défaut 'ekpognon' inchangé (NON-RÉGRESSION TopXpress/Soiroke).
+      # Whitelist regex identique env-vars.sh AVANT tout inline SSH (anti shell injection F1).
+      - name: Resolve + validate registry org (A2K_REGISTRY_ORG caller repo var)
+        env:
+          RAW_REGISTRY_ORG: ${{ vars.A2K_REGISTRY_ORG }}
+        run: |
+          set -euo pipefail
+          REGISTRY_ORG="${RAW_REGISTRY_ORG:-ekpognon}"
+          if ! printf '%s' "${REGISTRY_ORG}" | grep -qE '^[a-z][a-z0-9_-]{0,63}$'; then
+            echo "❌ A2K_REGISTRY_ORG invalide (whitelist ^[a-z][a-z0-9_-]{0,63}$): ${REGISTRY_ORG}" >&2
+            exit 1
+          fi
+          echo "REGISTRY_ORG=${REGISTRY_ORG}" >> "$GITHUB_ENV"
+          echo "✓ registry org resolved: ${REGISTRY_ORG}"
+
+      # Pre-flight Zone 4 secrets cascade VPS (defense-in-depth detection AVANT scp).
+      # Symétrique deploy.yml shared Traefik référence cycle 12 — Zone 4 perte = blocage runtime.
+      # Cycle 29 Wave 1 cont sub-action 6 : refactor adoption composite ssh-execute.
+      - name: Pre-flight Zone 4 secrets cascade VPS (composite ssh-execute)
+        uses: ./shared-infra/.github/actions/ssh-execute
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          # Trust boundary : command propagé inputs.env + inputs.app_name déjà whitelist regex validés.
+          command: |
+            set -euo pipefail
+            if ! test -f /etc/${{ inputs.app_name }}/${{ inputs.env }}/.env.secrets; then
+              echo "❌ Zone 4 secrets absent : /etc/${{ inputs.app_name }}/${{ inputs.env }}/.env.secrets" >&2
+              echo "   Trigger upstream: gh workflow run provision-app.yml env=${{ inputs.env }} app_name=${{ inputs.app_name }} dry_run=false" >&2
+              exit 1
+            fi
+            echo "✓ Zone 4 secrets cascade VPS OK"
+
+      # Cycle 29 ADR-010 push-and-forget Step 1 (REFACTOR cycle 29 Wave 1 cont sub-action 6) :
+      # Transport scp scripts/ shared (a2k-shared-infra) + hooks/ + compose + config → VPS.
+      # Architecture cycle 29 : shared scripts in a2k-shared-infra/scripts/ (cycle 29 ADR-010 Famille 1),
+      # apps fournissent hooks/*.sh per-app (file convention A7) + compose + config.
+      # Composite actions adoption : ssh-execute pour mkdir + chown + chmod / scp-vps pour transports.
+      - name: Ensure remote project dir + scripts/lib + hooks/ subdirs (composite ssh-execute)
+        uses: ./shared-infra/.github/actions/ssh-execute
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          command: |
+            set -euo pipefail
+            # Cycle 37 (ADR-008 amend / ADR-013) — umask 027 : point d'entrée SÉPARÉ (session ssh
+            # fraîche, n'hérite PAS de app-deploy.sh) → umask propre requis AVANT mkdir pour que
+            # scripts/lib + hooks héritent du groupe (setgid Z1) sans être world-readable (ops_discipline §5).
+            umask 027
+            REMOTE_DIR="/opt/${{ inputs.env }}/${{ inputs.app_name }}"
+            mkdir -p "${REMOTE_DIR}/scripts/lib" "${REMOTE_DIR}/hooks" "${REMOTE_DIR}/backup"
+            echo "✓ Remote project dir ready : ${REMOTE_DIR}"
+
+      - name: Transport shared scripts app-deploy.sh (composite scp-vps)
+        uses: ./shared-infra/.github/actions/scp-vps
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source_path: shared-infra/scripts/app-deploy.sh
+          target_path: /opt/${{ inputs.env }}/${{ inputs.app_name }}/scripts/app-deploy.sh
+          recursive: 'false'
+
+      - name: Transport shared scripts app-rollback.sh (composite scp-vps)
+        uses: ./shared-infra/.github/actions/scp-vps
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source_path: shared-infra/scripts/app-rollback.sh
+          target_path: /opt/${{ inputs.env }}/${{ inputs.app_name }}/scripts/app-rollback.sh
+          recursive: 'false'
+
+      - name: Transport shared scripts registry-cleanup.sh (composite scp-vps)
+        uses: ./shared-infra/.github/actions/scp-vps
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source_path: shared-infra/scripts/registry-cleanup.sh
+          target_path: /opt/${{ inputs.env }}/${{ inputs.app_name }}/scripts/registry-cleanup.sh
+          recursive: 'false'
+
+      # Backup V0 (ADR-015) : transport app-backup.sh — consommé par a2k-backup.service ExecStart
+      # (timer systemd VPS-side) + workflow backup.yml manuel. Placé AVANT le chmod +x scripts/*.sh.
+      - name: Transport shared scripts app-backup.sh (composite scp-vps)
+        uses: ./shared-infra/.github/actions/scp-vps
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source_path: shared-infra/scripts/app-backup.sh
+          target_path: /opt/${{ inputs.env }}/${{ inputs.app_name }}/scripts/app-backup.sh
+          recursive: 'false'
+
+      - name: Transport shared lib/ dir (composite scp-vps recursive)
+        uses: ./shared-infra/.github/actions/scp-vps
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source_path: shared-infra/scripts/lib/.
+          target_path: /opt/${{ inputs.env }}/${{ inputs.app_name }}/scripts/lib/
+          recursive: 'true'
+
+      - name: chmod +x shared scripts post-scp (composite ssh-execute)
+        uses: ./shared-infra/.github/actions/ssh-execute
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          command: |
+            set -euo pipefail
+            REMOTE_DIR="/opt/${{ inputs.env }}/${{ inputs.app_name }}"
+            chmod +x "${REMOTE_DIR}/scripts/"*.sh "${REMOTE_DIR}/scripts/lib/"*.sh
+            echo "✓ chmod +x shared scripts OK"
+
+      # Transport app artifacts (hooks/ + compose + config) from calling app repo.
+      # Cycle 29 A7 file convention : <compose_path>/hooks/*.sh executable bash.
+      - name: Detect app hooks/ presence
+        id: detect_hooks
+        env:
+          COMPOSE_PATH: ${{ inputs.compose_path }}
+        run: |
+          set -euo pipefail
+          if [ -d "app-repo/${COMPOSE_PATH}/hooks" ]; then
+            echo "hooks_present=true" >> "$GITHUB_OUTPUT"
+            echo "✓ app-repo/${COMPOSE_PATH}/hooks/ detected"
+          else
+            echo "hooks_present=false" >> "$GITHUB_OUTPUT"
+            echo "⚠ app-repo/${COMPOSE_PATH}/hooks/ absent — app may rely on smoke-test absent A8 enforce"
+          fi
+
+      - name: Transport app hooks/ dir (composite scp-vps conditional)
+        if: steps.detect_hooks.outputs.hooks_present == 'true'
+        uses: ./shared-infra/.github/actions/scp-vps
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source_path: app-repo/${{ inputs.compose_path }}/hooks/.
+          target_path: /opt/${{ inputs.env }}/${{ inputs.app_name }}/hooks/
+          recursive: 'true'
+
+      - name: chmod +x app hooks post-scp (composite ssh-execute conditional)
+        if: steps.detect_hooks.outputs.hooks_present == 'true'
+        uses: ./shared-infra/.github/actions/ssh-execute
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          command: |
+            set -euo pipefail
+            REMOTE_DIR="/opt/${{ inputs.env }}/${{ inputs.app_name }}"
+            chmod +x "${REMOTE_DIR}/hooks/"*.sh
+            echo "✓ chmod +x app hooks OK"
+
+      # Backup V0 (ADR-015) : manifest app-owned <compose_path>/backup/ (backup-manifest.yml).
+      # Absent = skip propre avec warn (app-backup.sh fail-fast VPS-side sur manifest absent).
+      - name: Detect app backup/ presence
+        id: detect_backup
+        env:
+          COMPOSE_PATH: ${{ inputs.compose_path }}
+        run: |
+          set -euo pipefail
+          if [ -d "app-repo/${COMPOSE_PATH}/backup" ]; then
+            echo "backup_present=true" >> "$GITHUB_OUTPUT"
+            echo "✓ app-repo/${COMPOSE_PATH}/backup/ detected"
+          else
+            echo "backup_present=false" >> "$GITHUB_OUTPUT"
+            echo "⚠ app-repo/${COMPOSE_PATH}/backup/ absent — app sans manifest backup (app-backup.sh fail-fast VPS-side)"
+          fi
+
+      - name: Transport app backup/ dir (composite scp-vps conditional)
+        if: steps.detect_backup.outputs.backup_present == 'true'
+        uses: ./shared-infra/.github/actions/scp-vps
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source_path: app-repo/${{ inputs.compose_path }}/backup/.
+          target_path: /opt/${{ inputs.env }}/${{ inputs.app_name }}/backup/
+          recursive: 'true'
+
+      - name: Transport app docker-compose.yml (composite scp-vps)
+        uses: ./shared-infra/.github/actions/scp-vps
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source_path: app-repo/${{ inputs.compose_path }}/docker-compose.yml
+          target_path: /opt/${{ inputs.env }}/${{ inputs.app_name }}/docker-compose.yml
+          recursive: 'false'
+
+      - name: Transport app .env.config (composite scp-vps)
+        uses: ./shared-infra/.github/actions/scp-vps
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source_path: app-repo/${{ inputs.compose_path }}/config/${{ inputs.env }}/.env.config
+          target_path: /opt/${{ inputs.env }}/${{ inputs.app_name }}/.env.config
+          recursive: 'false'
+
+      # E2E2 ADR-018 — Oracle O3 : checksum .env.config local (runner) == posé (VPS).
+      # Ordre STRICT : AVANT docker login GHCR (mismatch = zéro exécution VPS mutante).
+      - name: Freshness oracle O3a — sha256 local .env.config (runner)
+        env:
+          COMPOSE_PATH: ${{ inputs.compose_path }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/lib/freshness-oracle.sh
+          source shared-infra/scripts/lib/freshness-oracle.sh
+          sha="$(freshness_file_sha256 "app-repo/${COMPOSE_PATH}/config/${TARGET_ENV}/.env.config")"
+          echo "ENVCFG_LOCAL_SHA=${sha}" >> "$GITHUB_ENV"
+          echo "[freshness] O3 sha256 local .env.config = ${sha}"
+
+      # Anti-injection composite ssh-execute : command SANS $(...) ni backtick ni eval/declare —
+      # pattern `sha256sum -c` (2 espaces format obligatoires). ENVCFG_LOCAL_SHA = sha256 hex
+      # (sortie sha256sum, pas user-controlled) ; inputs.env + inputs.app_name déjà whitelist
+      # regex validés → inline sûr, pattern existant du fichier. Échec step = FAIL job (défaut).
+      - name: Freshness oracle O3b — checksum .env.config posé VPS (composite ssh-execute)
+        uses: ./shared-infra/.github/actions/ssh-execute
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          command: |
+            set -euo pipefail
+            printf '%s  %s\n' '${{ env.ENVCFG_LOCAL_SHA }}' '/opt/${{ inputs.env }}/${{ inputs.app_name }}/.env.config' | sha256sum -c -
+            echo "OK O3 checksum .env.config pose == local"
+
+      - name: Freshness oracle O3c — summary
+        if: success()
+        run: |
+          set -euo pipefail
+          echo "✅ O3 .env.config posé == local (sha256 ${ENVCFG_LOCAL_SHA})" >> "$GITHUB_STEP_SUMMARY"
+
+      # E2E2 ADR-018 — Oracle O4 drift tag (sémantique DA6) : >=1 clé *_VERSION du .env.config
+      # == container_image_tag. Évalué RUNNER-side sur le fichier local checkouté APRÈS O3 PASS
+      # (DA5 — équivalence garantie : O3 vient de prouver local == posé ; le composite ssh-execute
+      # n'a pas d'outputs et son anti-injection bannit $(...) → capture VPS-side impraticable).
+      - name: Freshness oracle O4 — tag drift .env.config (runner post-O3)
+        env:
+          COMPOSE_PATH: ${{ inputs.compose_path }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/lib/freshness-oracle.sh
+          source shared-infra/scripts/lib/freshness-oracle.sh
+          rc=0
+          freshness_check_tag_drift "app-repo/${COMPOSE_PATH}/config/${TARGET_ENV}/.env.config" "${TARGET_TAG}" || rc=$?
+          if [ "$rc" -eq 1 ]; then
+            echo "::error::[freshness] O4 FAIL — .env.config absent/illisible côté runner"
+            exit 1
+          fi
+          if [ "$rc" -eq 2 ]; then
+            echo "::warning::[freshness] O4 WARN — aucune clé *_VERSION du .env.config ne matche le tag ${TARGET_TAG} (drift probable — cf. DEPLOY-APP-INVOKER-GUIDE § Oracles fraîcheur)"
+            echo "FRESHNESS_WARN=true" >> "$GITHUB_ENV"
+            echo "FRESHNESS_WARN_REASONS=${FRESHNESS_WARN_REASONS:-}${FRESHNESS_WARN_REASONS:+ | }O4 drift tag ${TARGET_TAG} (aucune clé *_VERSION ne matche)" >> "$GITHUB_ENV"
+            echo "⚠ O4 drift tag (aucune clé *_VERSION == ${TARGET_TAG})" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "✅ O4 tag ${TARGET_TAG} présent dans .env.config" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # REGDOCK 2026-08-18 (A3) — DOCKER_CONFIG scopé PER-APP : fin du last-login-wins.
+      # Le login écrivait dans ~/.docker/config.json GLOBAL du user deploy (1 cred par host)
+      # → course entre deploys concurrents d'apps d'orgs GHCR différentes. Path DÉTERMINISTE
+      # ${HOME}/.docker-a2k/<app>-<env> (0700 deploy) — exporté ICI (session SSH login) ET
+      # dans le step Execute (session SSH distincte) : docker compose pull Phase 5 le voit.
+      # Layout documenté DEPLOY-APP-INVOKER-GUIDE § Docker config scopé per-app.
+      - name: Docker login GHCR sur VPS (pull image privée — composite ssh-execute)
+        uses: ./shared-infra/.github/actions/ssh-execute
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          command: |
+            set -euo pipefail
+            export DOCKER_CONFIG="${HOME}/.docker-a2k/${{ inputs.app_name }}-${{ inputs.env }}"
+            mkdir -p "${DOCKER_CONFIG}"
+            chmod 700 "${HOME}/.docker-a2k" "${DOCKER_CONFIG}"
+            SECRETS_FILE="/etc/${{ inputs.app_name }}/${{ inputs.env }}/.env.secrets"
+            set -a
+            . "${SECRETS_FILE}"
+            set +a
+            : "${GHCR_TOKEN:?GHCR_TOKEN absent de ${SECRETS_FILE}}"
+            printf '%s' "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USERNAME:-${{ github.actor }}}" --password-stdin
+
+      # F1 R1 HIGH — marker deploy_executed : posé UNIQUEMENT ici, juste avant l'exécution
+      # VPS réelle. Tout échec AVANT ce step (O1/O3/O4 FAIL, transport, docker login) laisse
+      # l'output vide → le job rollback legacy est SKIPPED (pas de downgrade spurieux).
+      # Échec du step Execute ci-dessous OU du healthcheck-wait aval → marker déjà posé →
+      # rollback légitime préservé.
+      - name: Mark deploy execution start (F1 gate rollback legacy)
+        id: deploy_execution_marker
+        run: |
+          set -euo pipefail
+          echo "executed=true" >> "$GITHUB_OUTPUT"
+          echo "[freshness] F1 marker : exécution VPS app-deploy.sh imminente (rollback legacy dé-gaté)"
+
+      # Cycle 29 ADR-010 push-and-forget Step 2 (REFACTOR sub-action 6) : execute bash scripts/app-deploy.sh.
+      # Invocation shared core script (cycle 29 A2 Famille 1) qui orchestre :
+      #   pre-deploy → docker compose pull/up → healthcheck → post-deploy → smoke-test (file convention hooks A7)
+      # Fail semantics A10 + audit log A11 + image retention A12+A13 enforce côté shared script.
+      - name: Execute app-deploy.sh local sur VPS (composite ssh-execute cycle 29 push-and-forget)
+        uses: ./shared-infra/.github/actions/ssh-execute
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          # Timeout 30min (deploy long ops : docker compose pull + up + healthcheck + smoke-test sequentiel).
+          timeout_minutes: '30'
+          # Trust boundary : inputs.env + inputs.app_name + inputs.container_image_tag déjà whitelist regex validés.
+          # Args propagés positionnels per app-deploy.sh CLI contract.
+          # REGDOCK (G2) : export A2K_REGISTRY_ORG (env.REGISTRY_ORG whitelist-validée step
+          # "Resolve + validate registry org") — consommée VPS-side par get_org() lib/env-vars.sh
+          # + audit-helpers.sh (Phase 3 pre-pull + Phase 9 rotation alias multi-org).
+          # REGDOCK (A3) : export DOCKER_CONFIG scopé — MÊME path déterministe que le step login
+          # (sessions SSH distinctes) → docker pull Phase 3 + compose pull Phase 5 lisent la
+          # cred per-app, plus le config.json global (fin du last-login-wins).
+          command: |
+            export A2K_REGISTRY_ORG='${{ env.REGISTRY_ORG }}'
+            export DOCKER_CONFIG="${HOME}/.docker-a2k/${{ inputs.app_name }}-${{ inputs.env }}"
+            bash /opt/${{ inputs.env }}/${{ inputs.app_name }}/scripts/app-deploy.sh '${{ inputs.env }}' '${{ inputs.app_name }}' '${{ inputs.container_image_tag }}'
+
+      # E2E2 ADR-018 — publication outputs freshness (if: always() — les WARN O1/O4 doivent
+      # remonter au job freshness-alert même si un step ultérieur du deploy échoue).
+      - name: Publish freshness outcome (outputs job)
+        id: freshness_outcome
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "warn=${FRESHNESS_WARN:-false}" >> "$GITHUB_OUTPUT"
+          echo "reasons=${FRESHNESS_WARN_REASONS:-}" >> "$GITHUB_OUTPUT"
+
+  # E2E2 ADR-018 — alerting freshness double canal, best-effort STRICT (§13.bis ops_discipline :
+  # side-effects monitoring ne DOIVENT JAMAIS faire échouer le critical path deploy) :
+  #   Canal 1 : issue GitHub avec DÉDUP titre canonique DA4 `[freshness] drift <app> <env>`
+  #             (UN titre par app+env — détail O4 drift vs app_ref vide dans body/commentaire).
+  #             Issue créée dans le repo CALLER (github.repository = app repo, ownership du drift).
+  #             Pré-requis caller : permissions `issues: write` sur le job invoker (sinon no-op).
+  #   Canal 2 : mail Brevo SMTP curl natif — envoi à CHAQUE occurrence WARN (rôle réveil,
+  #             pas de dédup mail) ; secrets/vars non câblés → skip graceful (::notice::).
+  freshness-alert:
+    name: Freshness alert (best-effort — issue dédup + mail Brevo)
+    needs: [deploy]
+    if: always() && needs.deploy.outputs.freshness_warn == 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true          # job-level : jamais bloquant
+    permissions:
+      contents: read
+      issues: write                  # dédup issue repo caller
+    env:
+      ALERT_TITLE: '[freshness] drift ${{ inputs.app_name }} ${{ inputs.env }}'
+      WARN_REASONS: ${{ needs.deploy.outputs.freshness_reasons }}
+    steps:
+      - name: Issue GitHub dédup (titre canonique DA4)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          BODY="⚠ Freshness WARN deploy — raisons : ${WARN_REASONS:-<non renseignées>}
+          Run : ${RUN_URL}
+          Cf. a2k-shared-infra \`docs/contracts/DEPLOY-APP-INVOKER-GUIDE.md\` § Oracles fraîcheur (O1/O3/O4)."
+          # F2 R1 MED — sans --limit, gh issue list plafonne à 30 → dédup silencieusement
+          # défaillante si >30 issues open. --search in:title = pré-filtre serveur ; l'égalité
+          # STRICTE jq reste le critère de dédup autoritaire.
+          existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --limit 200 --search "in:title \"${ALERT_TITLE}\"" --json number,title | jq -r --arg t "${ALERT_TITLE}" '.[] | select(.title == $t) | .number' | head -n 1)"
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --repo "${GITHUB_REPOSITORY}" --body "${BODY}"
+            echo "[freshness] alerting : commentaire ajouté à l'issue #${existing} (dédup titre exact)"
+          else
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "${ALERT_TITLE}" --body "${BODY}"
+            echo "[freshness] alerting : issue créée (titre canonique DA4)"
+          fi
+
+      # Secrets Brevo propagés via env: (auto-masqués GHA) + ::add-mask:: défensif AVANT usage.
+      # JAMAIS de secret dans les logs ni le step summary.
+      - name: Mail Brevo SMTP (curl natif — best-effort)
+        continue-on-error: true
+        env:
+          SMTP_USER: ${{ secrets.BREVO_SMTP_USER }}
+          SMTP_KEY: ${{ secrets.BREVO_SMTP_KEY }}
+          MAIL_TO: ${{ vars.FRESHNESS_ALERT_EMAIL_TO }}
+          MAIL_FROM: ${{ vars.FRESHNESS_ALERT_EMAIL_FROM }}
+          SMTP_HOST: ${{ vars.BREVO_SMTP_HOST }}
+          SMTP_PORT: ${{ vars.BREVO_SMTP_PORT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SMTP_USER}" ] || [ -z "${SMTP_KEY}" ] || [ -z "${MAIL_TO}" ] || [ -z "${MAIL_FROM}" ]; then
+            echo "::notice::alerting mail skipped (secrets/vars Brevo non câblés)"
+            exit 0
+          fi
+          echo "::add-mask::${SMTP_KEY}"
+          SMTP_HOST="${SMTP_HOST:-smtp-relay.brevo.com}"
+          SMTP_PORT="${SMTP_PORT:-587}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          MAIL_FILE="$(mktemp)"
+          {
+            printf 'From: %s\n' "${MAIL_FROM}"
+            printf 'To: %s\n' "${MAIL_TO}"
+            printf 'Subject: %s\n' "${ALERT_TITLE}"
+            printf '\n'
+            printf 'Freshness WARN deploy.\n'
+            printf 'Raisons : %s\n' "${WARN_REASONS:-<non renseignées>}"
+            printf 'Run : %s\n' "${RUN_URL}"
+          } > "${MAIL_FILE}"
+          curl --silent --show-error --ssl-reqd --max-time 30 \
+            --url "smtp://${SMTP_HOST}:${SMTP_PORT}" \
+            --user "${SMTP_USER}:${SMTP_KEY}" \
+            --mail-from "${MAIL_FROM}" \
+            --mail-rcpt "${MAIL_TO}" \
+            --upload-file "${MAIL_FILE}"
+          rm -f "${MAIL_FILE}"
+          echo "[freshness] alerting : mail envoyé (canal réveil — pas de dédup mail)"
+
+  # NOTE distinction sémantique cycle 12 push-and-forget :
+  # - GHA healthcheck-wait 120s : poll endpoint PUBLIC post-Traefik routing (validation externe user-facing).
+  # - deploy.sh healthcheck 180s : poll container INTERNAL docker compose ps healthy (validation interne app).
+  # Les 2 timeouts sont distincts par design — GHA externe vs container interne.
+  healthcheck-wait:
+    name: Healthcheck wait (timeout 120s)
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: inputs.healthcheck_url != ''
+    permissions:
+      contents: read
+    steps:
+      # Cycle 29 Wave 1 cont sub-action 6 : refactor adoption composite action healthcheck-wait.
+      # Composite action gère poll loop interne + outputs success/actual_status/duration_s.
+      # actions/checkout requis pour ./.github/actions/healthcheck-wait local path resolution.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          token: ${{ secrets.A2K_SHARED_INFRA_TOKEN }}
+
+      - name: Poll healthcheck endpoint (composite healthcheck-wait)
+        uses: ./.github/actions/healthcheck-wait
+        with:
+          healthcheck_url: ${{ inputs.healthcheck_url }}
+          timeout_seconds: '120'
+          interval_seconds: '2'
+          expected_status: '200'
+          max_request_time: '5'
+
+  # NOTE Sub-action 3 cycle 29 Wave 1 closure 4.5 (Finding C R3S2 + R1F8) :
+  # Job smoke-test SUPPRIMÉ — Mode A user Option 0 cleanup canonical.
+  # Smoke-test 100% canonical via hooks/smoke-test.sh A8 V0 OBLIGATOIRE (deploy.sh Phase 8).
+  # Cf. ADR-010 § A8 amend + DEPLOY-APP-INVOKER-GUIDE.md § Hooks contract.
+
+  rollback:
+    name: Rollback (best-effort si deploy/healthcheck fail)
+    needs: [deploy, healthcheck-wait]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env }}
+    # F1 R1 HIGH — gate deploy_executed : ce job ne s'exécute QUE si app-deploy.sh a réellement
+    # démarré côté VPS (marker posé juste avant Execute). Échec PRÉ-execute (O1 FAIL pré-transport,
+    # O3 FAIL post-scp, O4 FAIL, transport, docker login) → outputs.deploy_executed vide → SKIPPED :
+    # pas de downgrade spurieux :previous (N-1→N-2) d'une app saine où RIEN n'a été déployé.
+    # Échec Execute réel OU healthcheck-wait → marker 'true' → rollback légitime préservé.
+    if: failure() && inputs.rollback_on_fail && needs.deploy.outputs.deploy_executed == 'true'
+    permissions:
+      contents: read
+    env:
+      TARGET_ENV: ${{ inputs.env }}
+      APP_NAME: ${{ inputs.app_name }}
+    steps:
+      # Cycle37-hotfix (ssh-execute cross-repo fix) : checkout a2k-shared-infra (PAS caller repo)
+      # pour résolution local composite action `./.github/actions/ssh-execute`. Ce job (best-effort
+      # legacy rollback) n'utilise AUCUN artifact caller (que ssh-execute contre VPS) → shared-infra
+      # root suffit. Self-checkout `job.workflow_repository` + `ref: job.workflow_sha` = version-lock
+      # immuable au SHA du workflow pinné.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          token: ${{ secrets.A2K_SHARED_INFRA_TOKEN }}
+
+      # Cycle 29 Wave 1 cont sub-action 6 : refactor adoption composite actions.
+      - name: Resolve VPS target params (env-specific host + fingerprint selection)
+        env:
+          SSH_HOST_FINGERPRINT_STG: ${{ vars.SSH_HOST_FINGERPRINT_STG }}
+          SSH_HOST_FINGERPRINT_PRD: ${{ vars.SSH_HOST_FINGERPRINT_PRD }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_HOST_STG: ${{ vars.DEPLOY_HOST_STG }}
+          DEPLOY_HOST_PRD: ${{ vars.DEPLOY_HOST_PRD }}
+        run: |
+          set -euo pipefail
+          if [ "${TARGET_ENV}" = "stg" ]; then
+            echo "SSH_HOST=${DEPLOY_HOST_STG}" >> "$GITHUB_ENV"
+            echo "SSH_FINGERPRINT=${SSH_HOST_FINGERPRINT_STG}" >> "$GITHUB_ENV"
+            echo "SSH_USER=${DEPLOY_USER}" >> "$GITHUB_ENV"
+          elif [ "${TARGET_ENV}" = "prd" ]; then
+            echo "SSH_HOST=${DEPLOY_HOST_PRD}" >> "$GITHUB_ENV"
+            echo "SSH_FINGERPRINT=${SSH_HOST_FINGERPRINT_PRD}" >> "$GITHUB_ENV"
+            echo "SSH_USER=${DEPLOY_USER}" >> "$GITHUB_ENV"
+          else
+            echo "❌ TARGET_ENV invalide: ${TARGET_ENV}" >&2
+            exit 1
+          fi
+          echo "✓ VPS target params resolved (env=${TARGET_ENV})"
+
+      - name: Validate inputs regex (anti shell injection F1)
+        env:
+          REMOTE_APP: ${{ inputs.app_name }}
+        run: |
+          set -euo pipefail
+          # F1 HIGH symetrie defense-in-depth job `rollback` — meme whitelist app_name.
+          # NOTE: rollback utilise tag fixe `previous` (pas inputs.container_image_tag) — REMOTE_TAG validation N/A ici.
+          if ! printf '%s' "${REMOTE_APP}" | grep -qE '^[a-z][a-z0-9_-]{0,63}$'; then
+            echo "❌ app_name invalide (whitelist ^[a-z][a-z0-9_-]{0,63}$): ${REMOTE_APP}" >&2
+            exit 1
+          fi
+          echo "✓ inputs regex validation OK"
+
+      # REGDOCK 2026-08-18 (G2) — symétrie job legacy rollback : même transport org que le job
+      # deploy (app-rollback.sh consomme aussi get_org() pour le digest check anti-tampering F2).
+      - name: Resolve + validate registry org (A2K_REGISTRY_ORG caller repo var)
+        env:
+          RAW_REGISTRY_ORG: ${{ vars.A2K_REGISTRY_ORG }}
+        run: |
+          set -euo pipefail
+          REGISTRY_ORG="${RAW_REGISTRY_ORG:-ekpognon}"
+          if ! printf '%s' "${REGISTRY_ORG}" | grep -qE '^[a-z][a-z0-9_-]{0,63}$'; then
+            echo "❌ A2K_REGISTRY_ORG invalide (whitelist ^[a-z][a-z0-9_-]{0,63}$): ${REGISTRY_ORG}" >&2
+            exit 1
+          fi
+          echo "REGISTRY_ORG=${REGISTRY_ORG}" >> "$GITHUB_ENV"
+          echo "✓ registry org resolved: ${REGISTRY_ORG}"
+
+      # Cycle 29 ADR-010 A12 rollback — invocation shared scripts/app-rollback.sh in-place + pre-pull last 3.
+      # NEW dedicated rollback workflow rollback-app.yml (sous-action 4) — this best-effort step kept for legacy.
+      # Convention V0 : tag `<app>:previous` alias mobile (managed deploy.sh côté VPS).
+      # Cycle 29 Wave 1 cont sub-action 6 : refactor adoption composite ssh-execute.
+      - name: Rollback to previous tag (BEST-EFFORT cycle 29 — composite ssh-execute)
+        uses: ./.github/actions/ssh-execute
+        with:
+          ssh_host: ${{ env.SSH_HOST }}
+          ssh_user: ${{ env.SSH_USER }}
+          ssh_fingerprint: ${{ env.SSH_FINGERPRINT }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+          timeout_minutes: '15'
+          # REGDOCK (A3) : DOCKER_CONFIG scopé — dir persistant VPS créé par le step login du
+          # job deploy amont (même run) ; compose pull d'app-rollback.sh lit la cred per-app.
+          command: |
+            echo "⚠ Rollback BEST-EFFORT cycle 29 — convention ${{ inputs.app_name }}:previous alias mobile"
+            export A2K_REGISTRY_ORG='${{ env.REGISTRY_ORG }}'
+            export DOCKER_CONFIG="${HOME}/.docker-a2k/${{ inputs.app_name }}-${{ inputs.env }}"
+            bash /opt/${{ inputs.env }}/${{ inputs.app_name }}/scripts/app-rollback.sh '${{ inputs.env }}' '${{ inputs.app_name }}' previous
+
+  summary:
+    name: Summary report
+    needs: [validate-prereqs, deploy, healthcheck-wait, rollback]
+    runs-on: ubuntu-latest
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - name: Build summary
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          TARGET_ENV: ${{ inputs.env }}
+          TARGET_TAG: ${{ inputs.container_image_tag }}
+          COMPOSE_PATH: ${{ inputs.compose_path }}
+          HEALTHCHECK_URL: ${{ inputs.healthcheck_url }}
+          ROLLBACK_ENABLED: ${{ inputs.rollback_on_fail }}
+          TRIGGERED_BY: ${{ github.actor }}  # M5 cohérent inputs pattern propagation env
+          PREREQ_STATUS: ${{ needs.validate-prereqs.result }}
+          DEPLOY_STATUS: ${{ needs.deploy.result }}
+          HEALTHCHECK_STATUS: ${{ needs.healthcheck-wait.result }}
+          ROLLBACK_STATUS: ${{ needs.rollback.result }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Deploy App — ${APP_NAME} → ${TARGET_ENV} (tag ${TARGET_TAG})"
+            echo ""
+            echo "- **Mode** : reusable workflow_call (Phase E+1-bis cycle 26 — cycle 12 push-and-forget pattern)"
+            echo "- **App name** : ${APP_NAME}"
+            echo "- **Env** : ${TARGET_ENV}"
+            echo "- **Image tag** : ${TARGET_TAG}"
+            echo "- **Compose path** : ${COMPOSE_PATH}"
+            echo "- **Healthcheck URL** : ${HEALTHCHECK_URL:-<skipped>}"
+            echo "- **Smoke-test** : canonical via hooks/smoke-test.sh (A8 V0 OBLIGATOIRE — cycle 29 Wave 1 cleanup)"
+            echo "- **Rollback enabled** : ${ROLLBACK_ENABLED}"
+            echo "- **Triggered by** : ${TRIGGERED_BY}"
+            echo ""
+            echo "### Jobs status"
+            echo ""
+            echo "| Job | Status |"
+            echo "|---|---|"
+            echo "| validate-prereqs (Pattern A) | ${PREREQ_STATUS} |"
+            echo "| deploy (transport + execute deploy.sh) | ${DEPLOY_STATUS} |"
+            echo "| healthcheck-wait | ${HEALTHCHECK_STATUS} |"
+            echo "| rollback | ${ROLLBACK_STATUS} |"
+            echo ""
+            echo "### Cross-refs"
+            echo ""
+            echo "- ADR-010 (cycle 29 shared deploy architecture Famille 1 GHA-native B+C hybride + hooks contract A5)"
+            echo "- ADR-008 (K1 architecture cycle 26 — Pattern A PREREQ + roadmap E+1-bis)"
+            echo "- ADR-004 (cycle 12 push-and-forget pattern — cohérence stricte deploy.yml shared Traefik)"
+            echo "- \`docs/contracts/DEPLOY-APP-INVOKER-GUIDE.md\` (guide invoker app teams + hooks contract A5-A14)"
+            echo "- \`scripts/app-deploy.sh\` + \`scripts/app-rollback.sh\` (shared core cycle 29)"
+            echo "- \`.github/workflows/provision-app.yml\` (Phase E upstream provisioning)"
+            echo "- \`.github/workflows/infra-bootstrap-vps.yml\` (Phase D upstream INFRA)"
+            echo "- \`.github/workflows/rollback-app.yml\` (dedicated rollback workflow cycle 29 sous-action 4)"
+          } >> "$GITHUB_STEP_SUMMARY"
