@@ -26,6 +26,9 @@ scripts shell** pour déployer, rollbacker et backuper des apps Docker Compose s
 ```yaml
 jobs:
   deploy:
+    permissions:
+      contents: read   # checkout du repo app
+      issues: write    # alerting freshness (issue dédup dans le repo caller) — comportement à confirmer au premier run réel
     uses: ekpognon/a2k-deploy-kit/.github/workflows/deploy-app.yml@develop
     with:
       env: stg
@@ -43,7 +46,8 @@ jobs:
 > La passation explicite fonctionne dans tous les cas et expose moins (seul le secret requis
 > transite). Alerting freshness optionnel : ajouter `BREVO_SMTP_USER`/`BREVO_SMTP_KEY` au bloc
 > `secrets:` de la même façon. Contrat : `a2k-shared-infra/docs/contracts/DEPLOY-APP-INVOKER-GUIDE.md`
-> § Secrets GHA (+ § Contrat de format Zone 4 `.env.secrets` — valeurs single-quotées, zéro doublage `$`).
+> § Secrets GHA (+ § Contrat de format Zone 4 `.env.secrets` — valeurs single-quotées, zéro doublage `$`)
+> — **repo privé A2K : doc transmise aux apps externes par A2K dans le dossier d'onboarding**.
 
 > ⚠ **Note A15 (versions pinned / supply chain)** : `@develop` = **mode itération** (le kit évolue,
 > les apps suivent sans re-pin). La **recommandation prd / stabilisé reste le pin SHA**
@@ -54,7 +58,7 @@ Aucun PAT requis : le kit est public, le self-checkout interne
 (`repository: ${{ job.workflow_repository }}` + `ref: ${{ job.workflow_sha }}`) embarque
 actions + scripts **au même SHA que le workflow appelé** sans token.
 
-## Invariants contractuels (source de vérité : guides `a2k-shared-infra/docs/contracts/`)
+## Invariants contractuels (source de vérité : guides `a2k-shared-infra/docs/contracts/` — repo privé A2K, docs transmises aux apps externes par A2K dans le dossier d'onboarding)
 
 - **A6 — 11 env vars `A2K_*`** exportées aux hooks : `APP_NAME`, `ENV`, `IMAGE_TAG`, `PREVIOUS_TAG`,
   `PROJECT_DIR`, `SECRETS_FILE`, `ACTION`, `DEPLOY_TIMESTAMP`, `DRY_RUN`, `LOG_LEVEL`, `REGISTRY_ORG`
