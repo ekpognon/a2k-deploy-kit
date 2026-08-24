@@ -32,8 +32,18 @@ jobs:
       app_name: monapp
       container_image_tag: v1.2.3
       app_ref: ${{ github.sha }}
-    secrets: inherit
+    secrets:
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}  # passation EXPLICITE nommée — JAMAIS `secrets: inherit`
 ```
+
+> ⚠ **Secrets — passation explicite obligatoire (défaut #5, note etatcivil 2026-08-22)** :
+> `secrets: inherit` ne propage RIEN entre deux propriétaires GitHub distincts (doc GitHub :
+> même organization/enterprise uniquement) — toute app hors du compte propriétaire du kit
+> échoue plan-time (`Secret DEPLOY_SSH_KEY is required, but not provided while calling`).
+> La passation explicite fonctionne dans tous les cas et expose moins (seul le secret requis
+> transite). Alerting freshness optionnel : ajouter `BREVO_SMTP_USER`/`BREVO_SMTP_KEY` au bloc
+> `secrets:` de la même façon. Contrat : `a2k-shared-infra/docs/contracts/DEPLOY-APP-INVOKER-GUIDE.md`
+> § Secrets GHA (+ § Contrat de format Zone 4 `.env.secrets` — valeurs single-quotées, zéro doublage `$`).
 
 > ⚠ **Note A15 (versions pinned / supply chain)** : `@develop` = **mode itération** (le kit évolue,
 > les apps suivent sans re-pin). La **recommandation prd / stabilisé reste le pin SHA**
